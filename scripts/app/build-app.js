@@ -1,13 +1,18 @@
-import { command } from 'execa'
+import { execa } from 'execa'
 
-import log from '@/helpers/log'
+import { LogHelper } from '@/helpers/log-helper'
 
 /**
- * Build web app
+ * Build the selected client bundle for Leon's HTTP server.
  */
-export default () => new Promise(async (resolve) => {
-  await command('vite --config app/vite.config.js build', { shell: true, stdout: 'inherit' })
+export default async function buildApp(options = {}) {
+  const { quiet = false, configFile = 'apps/web-legacy/vite.config.js' } = options
 
-  log.success('Web app built')
-  resolve()
-})
+  await execa('vite', ['build', '--config', configFile], {
+    stdio: quiet ? 'ignore' : 'inherit'
+  })
+
+  if (!quiet) {
+    LogHelper.success('Web app built')
+  }
+}

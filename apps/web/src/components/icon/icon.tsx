@@ -1,0 +1,155 @@
+import { memo, useEffect, useState, type CSSProperties } from 'react'
+import { clsx } from 'clsx'
+import { getPublicAssetPath } from '@/config'
+
+import { COMMON_ICONS, ICON_VARIANT_ARTWORK, SOFT_ICON_NAMES, TOOL_ICON_NAMES, type IconDefinition } from './icon-definitions'
+import { getIconVariant, resolveIconName } from './icon-name'
+import { ASSET_ICONS } from './asset-icons'
+import { ICON_MORPHS, type MorphFrames } from './icon-morphs'
+import { MorphPaths } from './morph-paths'
+import { IconPaths } from './icon-paths'
+export { IconPaths } from './icon-paths'
+
+import './icon.sass'
+
+interface IconProps {
+  name: string
+  fallbackName?: string | undefined
+  className?: string
+  ariaLabel?: string | undefined
+  selected?: boolean | undefined
+  state?: string | undefined
+  morph?: boolean
+}
+
+const COMMON: Readonly<Record<string, IconDefinition>> = COMMON_ICONS
+const MORPH_TARGETS: Readonly<Record<string, readonly [string, string]>> = {
+  sun: ['theme', 'sun'], moon: ['theme', 'moon'],
+  'volume-up': ['sound', 'on'], 'volume-mute': ['sound', 'off'],
+  'sidebar-fold': ['sidebar', 'fold'], 'sidebar-unfold': ['sidebar', 'unfold'],
+  'send-ins': ['composer', 'send'], 'stop-mini': ['composer', 'stop'],
+  pushpin: ['pin', 'pinned'], unpin: ['pin', 'unpinned']
+}
+let toolArtwork: Readonly<Record<string, IconDefinition>> | undefined
+let toolArtworkRequest: Promise<void> | undefined
+let rareMorphs: Record<string, MorphFrames> | undefined
+let rareMorphsRequest: Promise<void> | undefined
+
+function loadRareMorphs(): Promise<void> {
+  rareMorphsRequest ??= import('./rare-icon-morphs').then((morphs) => {
+    rareMorphs = morphs.RARE_ICON_MORPHS
+  }).catch(() => {
+    rareMorphsRequest = undefined
+  })
+
+  return rareMorphsRequest
+}
+
+function loadToolArtwork(): Promise<void> {
+  toolArtworkRequest ??= import('./tool-icons').then((module) => {
+    toolArtwork = module.TOOL_ICONS
+  }).catch(() => {
+    // The immediately available fallback remains usable; a later mount can retry.
+    toolArtworkRequest = undefined
+  })
+
+  return toolArtworkRequest
+}
+
+function getArtwork(catalog: Readonly<Record<string, IconDefinition>> | undefined, name: string): IconDefinition | undefined {
+  return catalog && Object.hasOwn(catalog, name) ? catalog[name] : undefined
+}
+
+/**
+ * Displays trusted local artwork, with immediate fallbacks for unknown runtime names.
+ */
+export const Icon = memo(function Icon({ name, fallbackName = 'tools', className, ariaLabel, selected, state, morph: morphEnabled = false }: IconProps) {
+  const resolved = resolveIconName(name)
+  const fallback = resolveIconName(fallbackName)
+  const variant = getIconVariant(name)
+  const explicit = variant ? getArtwork(ICON_VARIANT_ARTWORK, `${resolved}-${variant}`) : undefined
+  const common = explicit ?? getArtwork(COMMON, resolved)
+  const requestedAsset = Object.hasOwn(ASSET_ICONS, resolved) ? ASSET_ICONS[resolved] : undefined
+  const tool = getArtwork(toolArtwork, resolved)
+  const diagramToggle = resolved === 'code-s-slash' && state !== undefined
+  const rare = diagramToggle || selected !== undefined && (resolved === 'list-check' || resolved === 'layout-column')
+  const isTool = !diagramToggle && !common && !requestedAsset &&
+    (TOOL_ICON_NAMES.has(resolved) || !Object.hasOwn(ASSET_ICONS, fallback) && TOOL_ICON_NAMES.has(fallback))
+  const [, setLoaded] = useState(0)
+
+  useEffect(() => {
+    if (!rare || rareMorphs !== undefined) {
+      return
+    }
+    let cancelled = false
+    void loadRareMorphs().then(() => {
+      if (!cancelled) {
+        setLoaded((revision) => revision + 1)
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [rare])
+
+  useEffect(() => {
+    if (!isTool || toolArtwork !== undefined) {
+      return
+    }
+
+    let cancelled = false
+    void loadToolArtwork().then(() => {
+      if (!cancelled) {
+        setLoaded((revision) => revision + 1)
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [isTool, resolved, fallback])
+
+  const shared = {
+    className: clsx('app-icon', className),
+    'data-icon': resolved,
+    'aria-hidden': ariaLabel === undefined ? true as const : undefined,
+    'aria-label': ariaLabel,
+    role: ariaLabel === undefined ? undefined : 'img'
+  }
+
+  const asset = requestedAsset ?? (!common && !tool && Object.hasOwn(ASSET_ICONS, fallback) ? ASSET_ICONS[fallback] : undefined)
+  if (asset) {
+    const src = getPublicAssetPath(asset.path)
+
+    return <span {...shared} className={clsx(shared.className, 'app-icon-mask')} data-icon-artwork="original"
+      style={{ '--app-icon-image': `url(${JSON.stringify(src)})` } as CSSProperties} />
+  }
+
+  const category = getArtwork(COMMON, fallback) ?? getArtwork(toolArtwork, fallback)
+  const definition = common ?? tool ?? category ?? COMMON_ICONS.tools
+  const artworkName = common || tool ? resolved : category ? fallback : 'tools'
+  const selectionFamily = selected !== undefined
+    ? resolved === 'list-check' ? 'list-selection' : resolved === 'layout-column' ? 'column-selection' : undefined
+    : undefined
+  const imageMorph = state !== undefined && (resolved === 'multi-image' || resolved === 'image-download' || resolved === 'expand-diagonal')
+    ? [resolved === 'multi-image' ? 'image-copy' : resolved === 'image-download' ? 'image-download' : 'expand', state] as const
+    : undefined
+  const morph = imageMorph ?? (diagramToggle ? ['diagram-view', state] as const : resolved === 'file-copy' && state !== undefined
+    ? ['copy', state] as const
+    : selectionFamily ? [selectionFamily, selected ? 'selected' : 'idle'] as const
+      : morphEnabled && !explicit && Object.hasOwn(MORPH_TARGETS, resolved) ? MORPH_TARGETS[resolved] : undefined)
+  const frames = morph ? ICON_MORPHS[morph[0]] ?? rareMorphs?.[morph[0]] : undefined
+
+  return (
+    <svg {...shared} data-icon-fallback={!frames && !common && !tool ? category ? fallback : 'tools' : undefined}
+      data-icon-artwork={SOFT_ICON_NAMES.has(artworkName) ? 'soft-b' : 'original'}
+      data-icon-variant={variant}
+      data-selected={selected} viewBox="0 0 24 24" fill="none" strokeWidth="2.1"
+      strokeLinecap="round" strokeLinejoin="round" focusable="false">
+      {frames && morph && frames[morph[1]] ? (
+        <MorphPaths key={morph[0]} frames={frames} state={morph[1]} />
+      ) : <IconPaths definition={definition} />}
+    </svg>
+  )
+})

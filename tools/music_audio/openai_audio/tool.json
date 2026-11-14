@@ -1,0 +1,58 @@
+{
+  "$schema": "../../../schemas/tool-schemas/tool.json",
+  "tool_id": "openai_audio",
+  "toolkit_id": "music_audio",
+  "name": "OpenAI Audio",
+  "version": "1.0.0",
+  "description": "A tool for audio processing using OpenAI's API.",
+  "icon_name": "openai-line",
+  "distribution": "built-in",
+  "maintenance": "official",
+  "maintainers": [
+    {
+      "name": "Louis Grenard",
+      "email": "louis@getleon.ai",
+      "github": "louistiti",
+      "discord": {
+        "username": "louistiti",
+        "id": "86842425233936384"
+      }
+    }
+  ],
+  "author": {
+    "name": "Louis Grenard",
+    "email": "louis@getleon.ai",
+    "url": "https://x.com/grenlouis",
+    "github": "louistiti",
+    "discord": {
+      "username": "louistiti",
+      "id": "86842425233936384"
+    }
+  },
+  "functions": {
+    "transcribeToFile": {
+      "description": "Transcribe audio to a file using OpenAI's audio transcription API.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "inputPath": {
+            "type": "string"
+          },
+          "outputPath": {
+            "type": "string"
+          },
+          "apiKey": {
+            "type": "string"
+          },
+          "model": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "inputPath",
+          "outputPath"
+        ]
+      }
+    }
+  }
+}

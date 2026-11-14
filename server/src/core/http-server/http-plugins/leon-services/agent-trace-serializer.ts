@@ -1,0 +1,168 @@
+import type { AgentProgressMessage } from '@/core/llm-manager/agent-progress-contract'
+import type { AgentResponseTrace } from '@/types'
+
+import type { HTTPPluginAgentTrace } from '../types'
+
+/**
+ * Converts persisted trace fields to the HTTP plugin schema.
+ */
+export function serializeAgentTrace(
+  trace: AgentResponseTrace,
+  includeDeveloperProvenance: boolean
+): HTTPPluginAgentTrace {
+  return {
+    ...(trace.answerStartedAt !== undefined ? { answer_started_at: trace.answerStartedAt } : {}),
+    ...(trace.timings ? { timings: trace.timings.map((timing) => ({ ...timing })) } : {}),
+    ...(trace.inferences
+      ? { inferences: trace.inferences.map((timing) => ({ ...timing })) }
+      : {}),
+    ...(trace.progressMessages
+      ? {
+          progress_messages: trace.progressMessages.map(serializeProgressMessage)
+        }
+      : {}),
+    ...(trace.reasoningSummary
+      ? { reasoning_summary: trace.reasoningSummary }
+      : {}),
+    plan_steps: trace.planSteps.map((step) => ({ ...step })),
+    ...(trace.planTransitions
+      ? {
+          plan_transitions: trace.planTransitions.map((transition) => ({
+            id: transition.id,
+            label: transition.label,
+            status: transition.status,
+            changed_at: transition.changedAt
+          }))
+        }
+      : {}),
+    tool_calls: trace.toolCalls.map((toolCall) => ({
+      id: toolCall.id,
+      ...(toolCall.planStepId !== undefined ? { plan_step_id: toolCall.planStepId } : {}),
+      name: toolCall.name,
+      ...(toolCall.toolkitName ? { toolkit_name: toolCall.toolkitName } : {}),
+      ...(toolCall.toolName ? { tool_name: toolCall.toolName } : {}),
+      ...(toolCall.toolCallTitle
+        ? { tool_call_title: toolCall.toolCallTitle }
+        : {}),
+      status: toolCall.status,
+      ...(toolCall.preparationStartedAt !== undefined
+        ? { preparation_started_at: toolCall.preparationStartedAt }
+        : {}),
+      ...(toolCall.startedAt !== undefined ? { started_at: toolCall.startedAt } : {}),
+      ...(toolCall.durationMs !== undefined ? { duration_ms: toolCall.durationMs } : {}),
+      ...(toolCall.toolkitIconName
+        ? { toolkit_icon_name: toolCall.toolkitIconName }
+        : {}),
+      ...(toolCall.toolIconName
+        ? { tool_icon_name: toolCall.toolIconName }
+        : {}),
+      ...(toolCall.toolLogo ? { tool_logo: toolCall.toolLogo } : {}),
+      ...(toolCall.input !== undefined ? { input: toolCall.input } : {}),
+      ...(toolCall.output !== undefined ? { output: toolCall.output } : {}),
+      ...(toolCall.commandOutput !== undefined ? { command_output: toolCall.commandOutput } : {}),
+      ...(toolCall.lastOutputAt !== undefined ? { last_output_at: toolCall.lastOutputAt } : {}),
+      ...(toolCall.progressMessage ? { progress_message: toolCall.progressMessage } : {}),
+      ...(toolCall.preparation ? { preparation: toolCall.preparation } : {}),
+      ...(toolCall.stepLabel ? { step_label: toolCall.stepLabel } : {}),
+      ...(toolCall.errorMessage
+        ? { error_message: toolCall.errorMessage }
+        : {}),
+      ...(toolCall.skillId ? { skill_id: toolCall.skillId } : {}),
+      ...(includeDeveloperProvenance && toolCall.nativeSkillPath
+        ? { native_skill_path: toolCall.nativeSkillPath }
+        : {})
+    })),
+    ...(trace.metrics ? { metrics: trace.metrics } : {})
+  }
+}
+
+/**
+ * Converts an HTTP plugin trace to Leon's persisted conversation schema.
+ */
+export function deserializeAgentTrace(
+  trace: HTTPPluginAgentTrace
+): AgentResponseTrace {
+  return {
+    ...(trace.answer_started_at !== undefined ? { answerStartedAt: trace.answer_started_at } : {}),
+    ...(trace.timings ? { timings: trace.timings.map((timing) => ({ ...timing })) } : {}),
+    ...(trace.inferences
+      ? { inferences: trace.inferences.map((timing) => ({ ...timing })) }
+      : {}),
+    ...(trace.progress_messages
+      ? {
+          progressMessages: trace.progress_messages.map((message) => ({
+            id: message.id,
+            content: message.content,
+            createdAt: message.created_at,
+            ...(message.skill ? { skill: message.skill } : {}),
+            ...(message.memory ? { memory: message.memory } : {}),
+            ...(message.icon_name ? { iconName: message.icon_name } : {}),
+            ...(message.plan_step_id !== undefined ? { planStepId: message.plan_step_id } : {})
+          }))
+        }
+      : {}),
+    reasoningSummary: trace.reasoning_summary || '',
+    planSteps: trace.plan_steps.map((step) => ({ ...step })),
+    ...(trace.plan_transitions
+      ? {
+          planTransitions: trace.plan_transitions.map((transition) => ({
+            id: transition.id,
+            label: transition.label,
+            status: transition.status,
+            changedAt: transition.changed_at
+          }))
+        }
+      : {}),
+    toolCalls: trace.tool_calls.map((toolCall) => ({
+      id: toolCall.id || toolCall.name,
+      ...(toolCall.plan_step_id !== undefined ? { planStepId: toolCall.plan_step_id } : {}),
+      name: toolCall.name,
+      ...(toolCall.toolkit_name ? { toolkitName: toolCall.toolkit_name } : {}),
+      ...(toolCall.tool_name ? { toolName: toolCall.tool_name } : {}),
+      ...(toolCall.tool_call_title
+        ? { toolCallTitle: toolCall.tool_call_title }
+        : {}),
+      status: toolCall.status,
+      ...(toolCall.preparation_started_at !== undefined
+        ? { preparationStartedAt: toolCall.preparation_started_at }
+        : {}),
+      ...(toolCall.started_at !== undefined ? { startedAt: toolCall.started_at } : {}),
+      ...(toolCall.duration_ms !== undefined ? { durationMs: toolCall.duration_ms } : {}),
+      ...(toolCall.toolkit_icon_name
+        ? { toolkitIconName: toolCall.toolkit_icon_name }
+        : {}),
+      ...(toolCall.tool_icon_name
+        ? { toolIconName: toolCall.tool_icon_name }
+        : {}),
+      ...(toolCall.tool_logo ? { toolLogo: toolCall.tool_logo } : {}),
+      ...(toolCall.input !== undefined ? { input: toolCall.input } : {}),
+      ...(toolCall.output !== undefined ? { output: toolCall.output } : {}),
+      ...(toolCall.command_output !== undefined ? { commandOutput: toolCall.command_output } : {}),
+      ...(toolCall.last_output_at !== undefined ? { lastOutputAt: toolCall.last_output_at } : {}),
+      ...(toolCall.progress_message ? { progressMessage: toolCall.progress_message } : {}),
+      ...(toolCall.preparation ? { preparation: toolCall.preparation } : {}),
+      ...(toolCall.step_label ? { stepLabel: toolCall.step_label } : {}),
+      ...(toolCall.error_message
+        ? { errorMessage: toolCall.error_message }
+        : {}),
+      ...(toolCall.skill_id ? { skillId: toolCall.skill_id } : {}),
+      ...(toolCall.native_skill_path
+        ? { nativeSkillPath: toolCall.native_skill_path }
+        : {})
+    })),
+    ...(trace.metrics ? { metrics: trace.metrics } : {})
+  }
+}
+
+/**
+ * Shares the same progress payload between live events and archived traces.
+ */
+export function serializeProgressMessage(message: AgentProgressMessage): NonNullable<HTTPPluginAgentTrace['progress_messages']>[number] {
+  return {
+    id: message.id, content: message.content, created_at: message.createdAt,
+    ...(message.iconName ? { icon_name: message.iconName } : {}),
+    ...(message.skill ? { skill: message.skill } : {}),
+    ...(message.memory ? { memory: message.memory } : {}),
+    ...(message.planStepId === undefined ? {} : { plan_step_id: message.planStepId })
+  }
+}

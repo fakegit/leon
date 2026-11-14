@@ -1,0 +1,699 @@
+import type { Locator, Page } from '@playwright/test'
+import type { SessionStatus } from '../../../apps/web/src/data/sessions'
+
+import { test, expect, SESSION_URL, SESSION_ID, OTHER_SESSION_ID, LATEST_ANSWER } from './fixtures'
+
+async function countWaves(page: Page): Promise<number> {
+  return page.evaluate(() => Reflect.get(window, 'composerWaveCount') as number)
+}
+
+/**
+ * Checks the painted caret against the native field's text origin.
+ */
+async function expectCaretAtTextStart(field: Locator): Promise<void> {
+  await expect(field).toBeFocused()
+  await expect(field.locator('..').locator('.input-effects-caret')).toBeVisible()
+  await expect.poll(() => field.evaluate((element: HTMLInputElement | HTMLTextAreaElement) => {
+    const style = getComputedStyle(element)
+    const canvas = document.createElement('canvas')
+    const context = canvas.getContext('2d')!
+    context.font = style.font
+
+    const glyph = (element.value || element.placeholder).charAt(0)
+    const box = element.getBoundingClientRect()
+    const caret = element.parentElement!.querySelector('.input-effects-block')!.getBoundingClientRect()
+    const textLeft = box.left + Number.parseFloat(style.borderLeftWidth) +
+      Number.parseFloat(style.paddingLeft)
+    const glyphCenter = textLeft + context.measureText(glyph).width / 2
+
+    return Math.abs(caret.left + caret.width / 2 - glyphCenter)
+  })).toBeLessThan(1)
+}
+
+interface ScrollTiming {
+  durationMs: number
+  gaps: number[]
+  landed: boolean
+}
+
+/**
+ * Measures the actual click-to-landing motion independently of driver latency.
+ */
+async function captureScrollTiming(button: Locator): Promise<void> {
+  await button.evaluate((element) => {
+    element.addEventListener('click', () => {
+      Reflect.set(window, 'scrollTiming', new Promise((resolve) => {
+        const startedAt = performance.now()
+        const main = document.querySelector<HTMLElement>('.app-main')!
+        const gaps = [main.scrollHeight - main.clientHeight - main.scrollTop]
+        const sample = (now: number): void => {
+          const gap = main.scrollHeight - main.clientHeight - main.scrollTop
+          gaps.push(gap)
+          if (gap < 2 || now - startedAt > 1_000) {
+            resolve({ durationMs: now - startedAt, gaps, landed: gap < 2 })
+          } else {
+            requestAnimationFrame(sample)
+          }
+        }
+
+        requestAnimationFrame(sample)
+      }))
+    }, { once: true })
+  })
+}
+
+test.beforeEach(async ({ page, ui }) => {
+  void ui
+  await page.addInitScript(() => {
+    let count = 0
+    const seen = new WeakSet<Element>()
+    Object.defineProperty(window, 'composerWaveCount', { get: () => count })
+    new MutationObserver(() => {
+      for (const wave of document.querySelectorAll('.query-input-focus-wave')) {
+        if (!seen.has(wave)) {
+          seen.add(wave)
+          count++
+        }
+      }
+    }).observe(document, { childList: true, subtree: true })
+  })
+})
+
+test('keeps autofocus, refresh, navigation and browser focus restoration silent', async ({ page, context }) => {
+  await page.goto(SESSION_URL)
+  const composer = page.getByRole('textbox', { name: 'Message Leon' })
+  await expect(composer).toBeFocused()
+  expect(await countWaves(page)).toBe(0)
+  await page.getByRole('link', { name: 'Test session 1', exact: true }).click()
+  await expect(page).toHaveURL(new RegExp(OTHER_SESSION_ID))
+  await expect(composer).toBeFocused()
+  expect(await countWaves(page)).toBe(0)
+  await page.reload()
+  await expect(composer).toBeFocused()
+  const otherPage = await context.newPage()
+  await otherPage.goto('about:blank')
+  await otherPage.bringToFront()
+  await page.bringToFront()
+  await composer.blur()
+  await composer.focus()
+  expect(await countWaves(page)).toBe(0)
+  await otherPage.close()
+})
+
+test('plays on a blurred-to-focused pointer transition, not clicks while already focused', async ({ page }) => {
+  await page.goto(SESSION_URL)
+  const composer = page.getByRole('textbox', { name: 'Message Leon' })
+  await expect(composer).toBeFocused()
+  await composer.click()
+  expect(await countWaves(page)).toBe(0)
+  await page.getByRole('button', { name: 'Add attachment' }).click()
+  await composer.click()
+  await expect.poll(() => countWaves(page)).toBe(1)
+  await expect(page.locator('.query-input-focus-wave')).toHaveCount(0)
+  await composer.fill('Typing does not restart the wave')
+  await composer.click()
+  expect(await countWaves(page)).toBe(1)
+})
+
+test('plays on keyboard Tab focus but not programmatic focus', async ({ page }) => {
+  await page.goto(SESSION_URL)
+  const attachment = page.getByRole('button', { name: 'Add attachment' })
+  await attachment.focus()
+  await page.getByRole('textbox', { name: 'Message Leon' }).focus()
+  expect(await countWaves(page)).toBe(0)
+  await attachment.focus()
+  await page.keyboard.press('Tab')
+  await expect(page.getByRole('textbox', { name: 'Message Leon' })).toBeFocused()
+  await expect.poll(() => countWaves(page)).toBe(1)
+})
+
+test('respects reduced motion on deliberate focus', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  await page.goto(SESSION_URL)
+  await page.getByRole('button', { name: 'Add attachment' }).click()
+  await page.getByRole('textbox', { name: 'Message Leon' }).click()
+  expect(await countWaves(page)).toBe(0)
+})
+
+test('aligns search carets with placeholders, edited text and cleared values', async ({ page }) => {
+  await page.goto(SESSION_URL)
+  await page.evaluate(() => document.fonts.ready)
+  await expectCaretAtTextStart(page.getByRole('textbox', { name: 'Message Leon' }))
+
+  await page.getByRole('button', { name: /^Choose model, current:/ }).click()
+  const modelSearch = page.getByRole('combobox', { name: 'Search models', exact: true })
+  await expectCaretAtTextStart(modelSearch)
+  await modelSearch.fill('models')
+  await modelSearch.press('Home')
+  await expectCaretAtTextStart(modelSearch)
+  await modelSearch.fill('')
+  await expectCaretAtTextStart(modelSearch)
+  await page.keyboard.press('Escape')
+
+  await page.getByRole('button', { name: 'Search sessions', exact: true }).click()
+  const sessionSearch = page.getByRole('combobox', { name: 'Search sessions', exact: true })
+  await expectCaretAtTextStart(sessionSearch)
+  await sessionSearch.fill('sessions')
+  await sessionSearch.press('Home')
+  await expectCaretAtTextStart(sessionSearch)
+  await sessionSearch.fill('')
+  await expectCaretAtTextStart(sessionSearch)
+})
+
+test('keeps composer action alignment independent of text font metrics', async ({ page }) => {
+  await page.goto(SESSION_URL)
+  await page.evaluate(() => document.fonts.ready)
+  const send = page.getByRole('button', { name: 'Send message', exact: true })
+
+  for (const fontFamily of ['serif', 'sans-serif', 'monospace']) {
+    await send.evaluate((element, family) => {
+      element.style.fontFamily = family
+    }, fontFamily)
+    const offset = await send.evaluate((element) => {
+      const button = element.getBoundingClientRect()
+      const icon = element.querySelector('.button-icon')!.getBoundingClientRect()
+
+      return Math.abs(icon.top + icon.height / 2 - button.top - button.height / 2)
+    })
+
+    expect(offset).toBeLessThan(0.1)
+  }
+})
+
+test('recalls only from empty input and keeps normal caret navigation after editing', async ({ page, ui }) => {
+  await page.goto(SESSION_URL)
+  const composer = page.getByRole('textbox', { name: 'Message Leon' })
+  await expect(composer).toBeFocused()
+  const requests = (): number => ui.requests.filter((url) => url.pathname.endsWith('/queries')).length
+  expect(requests()).toBe(0)
+  await composer.fill('My own\nmultiline draft')
+  await composer.press('ArrowUp')
+  await expect(composer).toHaveValue('My own\nmultiline draft')
+  expect(requests()).toBe(0)
+  await composer.fill('')
+  await composer.dispatchEvent('keydown', { key: 'ArrowUp', isComposing: true })
+  await composer.press('Shift+ArrowUp')
+  expect(requests()).toBe(0)
+  await composer.press('ArrowUp')
+  await expect(composer).toHaveValue('Saved question 239')
+  await expect.poll(() => composer.evaluate((element: HTMLTextAreaElement) => element.selectionStart)).toBe('Saved question 239'.length)
+  await composer.press('ArrowUp')
+  await expect(composer).toHaveValue('Saved question 238')
+  await composer.press('ArrowDown')
+  await expect(composer).toHaveValue('Saved question 239')
+  await composer.press('ArrowDown')
+  await expect(composer).toHaveValue('')
+  await composer.press('ArrowUp')
+  await expect(composer).toHaveValue('Saved question 239')
+  await composer.press('End')
+  await composer.press('!')
+  await composer.press('ArrowUp')
+  await expect(composer).toHaveValue('Saved question 239!')
+  expect(requests()).toBe(1)
+})
+
+test('recalls 128 queries lazily without changing the feed or fetching beyond the limit', async ({ page, ui }) => {
+  ui.history.set(SESSION_ID, Array.from({ length: 133 }, (_, index) => ({
+    who: 'owner', messageId: `query-${index}`, message: `Query ${index}`,
+    sentAt: index, isAddedToHistory: true
+  })))
+  await page.goto(SESSION_URL)
+  const composer = page.getByRole('textbox', { name: 'Message Leon' })
+  await expect(composer).toBeFocused()
+  const feedRequests = ui.historyRequests.length
+  for (let index = 132; index >= 5; index--) {
+    await composer.press('ArrowUp')
+    await expect(composer).toHaveValue(`Query ${index}`)
+  }
+  await composer.press('ArrowUp')
+  await expect(composer).toHaveValue('Query 5')
+  expect(ui.requests.filter((url) => url.pathname.endsWith('/queries'))).toHaveLength(3)
+  expect(ui.historyRequests).toHaveLength(feedRequests)
+  await composer.press('ArrowDown')
+  await expect(composer).toHaveValue('Query 6')
+})
+
+test('recalls newly submitted queries after refresh and isolates navigation between sessions', async ({ page, ui }) => {
+  ui.history.get(OTHER_SESSION_ID)!.push({
+    who: 'owner', messageId: 'other-query', message: 'Other session query', sentAt: 1, isAddedToHistory: true
+  })
+  await page.goto(SESSION_URL)
+  const composer = page.getByRole('textbox', { name: 'Message Leon' })
+  await composer.press('ArrowUp')
+  await expect(composer).toHaveValue('Saved question 239')
+  await composer.fill('My latest query')
+  await composer.press('Enter')
+  await expect(page.getByText('Completed My latest query', { exact: true })).toBeVisible()
+  await composer.press('ArrowUp')
+  await expect(composer).toHaveValue('My latest query')
+  await page.getByRole('link', { name: 'Test session 1', exact: true }).click()
+  await composer.press('ArrowUp')
+  await expect(composer).toHaveValue('Other session query')
+  await page.getByRole('link', { name: 'Test session 0', exact: true }).click()
+  await expect(composer).toHaveValue('My latest query')
+  await composer.fill('')
+  await composer.press('ArrowUp')
+  await expect(composer).toHaveValue('My latest query')
+  await page.reload()
+  await expect(composer).toBeFocused()
+  await expect(composer).toHaveValue('My latest query')
+  await composer.fill('')
+  await composer.press('ArrowUp')
+  await expect(composer).toHaveValue('My latest query')
+})
+
+test('does not overwrite drafts or another session when a history request finishes late', async ({ page, ui }) => {
+  let release!: () => void
+  let gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let started = false
+  await page.route('**/sessions/*/queries?**', async (route) => {
+    started = true
+    await gate
+    await route.fallback()
+  })
+  try {
+    await page.goto(SESSION_URL)
+    const composer = page.getByRole('textbox', { name: 'Message Leon' })
+    await composer.press('ArrowUp')
+    await expect.poll(() => started).toBe(true)
+    await composer.fill('Do not replace this draft')
+    release()
+    await expect.poll(() => ui.completedRequests.filter((url) => url.pathname.endsWith('/queries')).length).toBe(1)
+    await expect(composer).toHaveValue('Do not replace this draft')
+    await composer.fill('')
+    await composer.press('ArrowUp')
+    await expect(composer).toHaveValue('Saved question 239')
+    await page.getByRole('link', { name: 'Test session 1', exact: true }).click()
+    await expect(composer).toHaveValue('')
+    started = false
+    gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const pending = page.waitForRequest((request) =>
+      request.url().includes(`/sessions/${OTHER_SESSION_ID}/queries`))
+    await composer.press('ArrowUp')
+    const request = await pending
+    await expect.poll(() => started).toBe(true)
+    await page.getByRole('link', { name: 'Test session 0', exact: true }).click()
+    await composer.fill('A different session draft')
+    release()
+    await request.response()
+    await expect(composer).toHaveValue('A different session draft')
+  } finally {
+    release()
+  }
+})
+
+test('reports failed history reads in a toast and allows another recall attempt', async ({ page, ui }) => {
+  ui.failure = { path: `/api/v1/sessions/${SESSION_ID}/queries`, status: 400, message: 'Query history is unavailable.' }
+  await page.goto(SESSION_URL)
+  const composer = page.getByRole('textbox', { name: 'Message Leon' })
+  await composer.press('ArrowUp')
+  await expect(page.getByText('Could not load query history', { exact: true })).toBeVisible()
+  await expect(composer).toHaveValue('')
+  ui.failure = undefined
+  await composer.press('ArrowUp')
+  await expect(composer).toHaveValue('Saved question 239')
+})
+
+test('bounds long-query text without truncating recalled input', async ({ page, ui }) => {
+  test.setTimeout(60_000)
+  const message = 'Long query '.repeat(8_000)
+  ui.history.set(SESSION_ID, Array.from({ length: 100 }, (_, index) => ({
+    who: 'owner', messageId: `long-${index}`, message: `${message}${index}`,
+    sentAt: index, isAddedToHistory: true
+  })))
+  await page.goto(SESSION_URL)
+  const composer = page.getByRole('textbox', { name: 'Message Leon' })
+  for (let index = 99; index >= 89; index--) {
+    await composer.press('ArrowUp')
+    await expect(composer).toHaveValue(`${message}${index}`)
+  }
+  await composer.press('ArrowUp')
+  await expect(composer).toHaveValue(`${message}89`)
+  const requests = ui.requests.filter((url) => url.pathname.endsWith('/queries'))
+  expect(requests).toHaveLength(12)
+  expect(Number(requests.at(-1)!.searchParams.get('characters'))).toBeLessThan(message.length)
+})
+
+for (const theme of ['light', 'dark'] as const) {
+  test(`renders local artwork for selectable and selected model providers (${theme})`, async ({ page, ui }, testInfo) => {
+    const logos = new Map<string, number>()
+    page.on('response', (response) => {
+      const pathname = new URL(response.url()).pathname
+      if (pathname.includes('/img/providers/')) {
+        logos.set(pathname, response.status())
+      }
+    })
+    const model = ui.models.providers[0]!.models[0]!
+    ui.models.providers = [...ui.models.providers, ...[
+      { id: 'groq', label: 'Groq' }, { id: 'cerebras', label: 'Cerebras' }
+    ].map((provider) => ({ ...provider, models: [{ ...model, model: 'fixture-chat', label: 'Fixture chat' }] }))]
+    await page.goto(SESSION_URL)
+    if (theme === 'light') {
+      await page.getByRole('button', { name: 'Apply light theme', exact: true }).click()
+    }
+    const popup = page.getByRole('dialog', { name: 'Choose a model', exact: true })
+    await page.getByRole('button', { name: /^Choose model, current:/ }).click()
+    for (const provider of ui.models.providers) {
+      const row = popup.getByRole('option', { name: provider.label, exact: true })
+      await expect(row.locator('.llm-provider-icon')).toBeVisible()
+      const pathname = `/web-app/img/providers/${provider.id}.svg`
+      await expect.poll(() => logos.get(pathname)).toBe(200)
+      expect(await page.evaluate(async (url) => {
+        const image = new Image()
+        image.src = url
+        await image.decode()
+        const canvas = document.createElement('canvas')
+        canvas.width = canvas.height = 24
+        const context = canvas.getContext('2d')!
+        context.drawImage(image, 0, 0, 24, 24)
+
+        return context.getImageData(0, 0, 24, 24).data.some((value, index) => index % 4 === 3 && value > 0)
+      }, pathname)).toBe(true)
+    }
+    await popup.screenshot({ path: testInfo.outputPath(`provider-logos-${theme}.png`) })
+    for (const provider of ui.models.providers.slice(1)) {
+      await popup.getByRole('option', { name: provider.label, exact: true }).click()
+      await popup.getByRole('option', { name: 'Fixture chat', exact: true }).click()
+      const selected = page.getByRole('button', { name: `Choose model, current: ${provider.label}, Fixture chat`, exact: true })
+      await expect(selected).toBeVisible()
+      await expect(selected.locator('.llm-provider-icon')).toHaveCSS('mask-image', new RegExp(`/img/providers/${provider.id}\\.svg`))
+      await selected.click()
+    }
+    await page.keyboard.press('Escape')
+  })
+}
+
+for (const reducedMotion of ['no-preference', 'reduce'] as const) {
+  test(`quickly returns to drafting after scrolling to the bottom with ${reducedMotion} motion`, async ({ page }, testInfo) => {
+    await page.emulateMedia({ reducedMotion })
+    await page.goto(SESSION_URL)
+    await expect(page.getByText(LATEST_ANSWER, { exact: true })).toBeVisible()
+    const composer = page.getByRole('textbox', { name: 'Message Leon' })
+    await composer.fill('Keep drafting after scrolling')
+    const main = page.locator('.app-main')
+    const scrollButton = page.getByRole('button', { name: 'Scroll to bottom' })
+
+    const timings: ScrollTiming[] = []
+    for (const [activation, distance] of [
+      ['pointer', 800], ['keyboard', 800], ['pointer', 5_000], ['keyboard', 5_000]
+    ] as const) {
+      await expect.poll(() => main.evaluate((element) =>
+        Math.abs(element.scrollHeight - element.clientHeight - element.scrollTop)
+      )).toBeLessThanOrEqual(2)
+      // A real gesture relinquishes any still-settling programmatic scroll.
+      await main.hover()
+      await page.mouse.wheel(0, -distance)
+      await expect(scrollButton).toBeVisible()
+      await captureScrollTiming(scrollButton)
+      if (activation === 'pointer') {
+        await scrollButton.click()
+      } else {
+        await scrollButton.focus()
+        await scrollButton.press('Enter')
+      }
+
+      await expect(composer).toBeFocused()
+      await expect(composer).toHaveValue('Keep drafting after scrolling')
+      await expect.poll(() => main.evaluate((element) =>
+        Math.abs(element.scrollHeight - element.clientHeight - element.scrollTop)
+      )).toBeLessThanOrEqual(2)
+      const timing = await page.evaluate(async () => await Reflect.get(window, 'scrollTiming')) as ScrollTiming
+      timings.push(timing)
+      expect(timing.landed).toBe(true)
+      expect(timing.durationMs).toBeLessThan(320)
+      const hadIntermediatePosition = timing.gaps.some((gap) => gap > 2 && gap < timing.gaps[0]! - 2)
+      expect(hadIntermediatePosition).toBe(reducedMotion === 'no-preference')
+      expect(await countWaves(page)).toBe(0)
+    }
+
+    await testInfo.attach('scroll-timings', { body: JSON.stringify(timings), contentType: 'application/json' })
+  })
+}
+
+test('plays one entrance wave on each new-session landing, including refresh', async ({ page }) => {
+  await page.goto('./')
+  const composer = page.getByRole('textbox', { name: 'Message Leon' })
+  await expect(composer).toBeFocused()
+  await expect.poll(() => countWaves(page)).toBe(1)
+  await expect(page.locator('.query-input-focus-wave')).toHaveCount(0)
+  await composer.click()
+  expect(await countWaves(page)).toBe(1)
+  await page.getByRole('link', { name: 'Test session 0', exact: true }).click()
+  await expect(composer).toBeFocused()
+  expect(await countWaves(page)).toBe(1)
+  await page.getByRole('link', { name: 'New session', exact: true }).click()
+  await expect.poll(() => countWaves(page)).toBe(2)
+  await page.reload()
+  await expect.poll(() => countWaves(page)).toBe(1)
+})
+
+for (const reducedMotion of ['no-preference', 'reduce'] as const) {
+  test(`keeps multiline drafts and the last answer reachable above the composer (${reducedMotion})`, async ({ page, ui }, testInfo) => {
+    const errors: string[] = []
+    const onPageError = (error: Error): void => {
+      errors.push(error.message)
+    }
+    page.on('pageerror', onPageError)
+    await page.emulateMedia({ reducedMotion })
+    await page.setViewportSize({ width: 1_366, height: 720 })
+    const answer = ui.history.get(SESSION_ID)!.at(-1)!
+    answer.message = 'A line of the answer.\n'.repeat(80) + 'The final line stays reachable.'
+    await page.goto(SESSION_URL)
+    const composer = page.getByRole('textbox', { name: 'Message Leon' })
+    await composer.fill('A line of the draft.\n'.repeat(40))
+    const form = page.getByRole('form', { name: 'Send a message to Leon' })
+    await expect(form).toHaveClass(/query-input-expanded/)
+    await expect(page.locator('.query-input-field')).toHaveClass(/query-input-field-scrollable/)
+    await expect.poll(async () => (await form.boundingBox())!.height).toBeLessThan(720 / 2)
+    await expect.poll(async () => {
+      const glow = await page.locator('.query-input-glow').boundingBox()
+      const bounds = await form.boundingBox()
+      return Math.abs(glow!.y - bounds!.y)
+    }).toBeLessThanOrEqual(1)
+    const main = page.locator('.app-main')
+    const lastAnswer = page.getByRole('region', { name: 'Leon’s final answer', exact: true }).last()
+    const expectReachable = async (): Promise<void> => {
+      await main.evaluate((element) => element.scrollTo({ top: element.scrollHeight }))
+      await expect.poll(async () => {
+        const end = await lastAnswer.boundingBox()
+        const top = await form.boundingBox()
+        return top!.y - end!.y - end!.height
+      }).toBeGreaterThan(0)
+    }
+    await expectReachable()
+    for (const theme of ['light', 'dark']) {
+      await page.locator('html').evaluate((element, value) => element.setAttribute('data-theme', value), theme)
+      await page.evaluate(async () => {
+        await Promise.allSettled(document.getAnimations().filter((animation) => animation instanceof CSSTransition)
+          .map((animation) => animation.finished))
+      })
+      const path = testInfo.outputPath(`multiline-${theme}.png`)
+      await page.screenshot({ path })
+      await testInfo.attach(`multiline-${theme}`, { path, contentType: 'image/png' })
+    }
+    await page.setViewportSize({ width: 800, height: 560 })
+    await expect.poll(async () => (await form.boundingBox())!.height).toBeLessThan(560 / 2)
+    await expectReachable()
+    await composer.fill('Short again')
+    await expect(form).not.toHaveClass(/query-input-expanded/)
+    await expectReachable()
+    await expect(composer).toHaveValue('Short again')
+    expect(errors).toEqual([])
+    page.off('pageerror', onPageError)
+  })
+}
+
+test('lets a wheel gesture interrupt the fast return without pulling the owner back down', async ({ page }) => {
+  await page.goto(SESSION_URL)
+  await expect(page.getByText(LATEST_ANSWER, { exact: true })).toBeVisible()
+  const main = page.locator('.app-main')
+  const scrollButton = page.getByRole('button', { name: 'Scroll to bottom', exact: true })
+  await main.evaluate((element) => element.scrollTo({ top: element.scrollTop - 4_000 }))
+  await expect(scrollButton).toBeVisible()
+  // Control the animation clock so the wheel gesture always arrives mid-scroll,
+  // independently of how long browser commands wait for a parallel worker.
+  const now = new Date()
+  await page.clock.install({ time: now })
+  await page.clock.pauseAt(new Date(now.getTime() + 10_000))
+  await scrollButton.click()
+  await page.clock.runFor(32)
+  expect(await main.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop
+  )).toBeGreaterThan(64)
+  await page.mouse.wheel(0, -400)
+  // Observe beyond the animation's deadline; a cancelled target must not resume.
+  await page.clock.runFor(1_000)
+  const remaining = await main.evaluate((element) => element.scrollHeight - element.clientHeight - element.scrollTop)
+  expect(remaining).toBeGreaterThan(64)
+  await expect(scrollButton).toBeVisible()
+  await expect(page.getByRole('textbox', { name: 'Message Leon' })).toBeFocused()
+})
+
+test('retargets the fast return when streamed content grows before landing', async ({ page, ui }) => {
+  const record = ui.history.get(SESSION_ID)!.at(-1)!
+  record.message = 'A line in a streamed answer.\n'.repeat(80)
+  record.isAddedToHistory = false
+  record.draftGeneration = 'growing-answer'
+  ui.sessions[0]!.status = 'wip' as SessionStatus
+  await page.goto(SESSION_URL)
+  const main = page.locator('.app-main')
+  const scrollButton = page.getByRole('button', { name: 'Scroll to bottom', exact: true })
+  await expect.poll(() => main.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop
+  )).toBeLessThanOrEqual(2)
+  await main.evaluate((element) => element.scrollTo({ top: element.scrollTop - 1_500 }))
+  await expect(scrollButton).toBeVisible()
+  await captureScrollTiming(scrollButton)
+  await scrollButton.click()
+  await ui.emit([{
+    type: 'text_stream', sequence: 1, session_id: SESSION_ID,
+    turn_id: 'growing-owner', response_id: record.messageId, created_at: Date.now(),
+    data: { kind: 'answer', generationId: 'growing-answer', token: 'More arriving content.\n'.repeat(25) }
+  }])
+  await expect.poll(() => main.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop
+  )).toBeLessThanOrEqual(2)
+  const timing = await page.evaluate(async () => await Reflect.get(window, 'scrollTiming')) as ScrollTiming
+  expect(timing.landed).toBe(true)
+  expect(timing.durationMs).toBeLessThan(320)
+  await expect(page.getByRole('textbox', { name: 'Message Leon' })).toBeFocused()
+})
+
+for (const reducedMotion of ['no-preference', 'reduce'] as const) {
+  test(`selects and persists a local model through the provider menu (${reducedMotion})`, async ({ page, ui }) => {
+    await page.emulateMedia({ reducedMotion })
+    ui.models.providers = [...ui.models.providers, {
+      id: 'llamacpp', label: 'llama.cpp', models: [{
+        model: 'fixture-9b.gguf', label: 'Fixture 9B', recommended: false,
+        reasoning: ['auto'], speed: ['auto'], defaultReasoningLabel: 'Model default'
+      }]
+    }]
+    await page.goto(SESSION_URL)
+    await page.getByRole('button', { name: 'Choose model, current: OpenAI, GPT-6.1 Sol', exact: true }).click()
+    const popup = page.getByRole('dialog', { name: 'Choose a model', exact: true })
+    await popup.getByRole('option', { name: 'llama.cpp', exact: true }).click()
+    await popup.getByRole('option', { name: 'Fixture 9B', exact: true }).click()
+
+    const trigger = page.getByRole('button', { name: 'Choose model, current: llama.cpp, Fixture 9B', exact: true })
+    await expect(trigger).toBeVisible()
+    await expect.poll(() => ui.sessions.find((session) => session.id === SESSION_ID)?.modelTarget)
+      .toBe('llamacpp/fixture-9b.gguf')
+    await page.reload()
+    await expect(trigger).toBeVisible()
+    await trigger.click()
+    await popup.getByRole('combobox', { name: 'Search models', exact: true }).fill('fixture-9b')
+    await expect(popup.getByRole('option', { name: 'Fixture 9B llama.cpp', exact: true })).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(trigger).toBeFocused()
+  })
+}
+
+test('shares keyboard navigation across virtual model results and reasoning/service-tier choices', async ({ page, ui }) => {
+  const provider = ui.models.providers[0]!
+  const model = provider.models[0]!
+  ui.models.providers = [{ ...provider, models: [model, ...Array.from({ length: 60 }, (_, index) => ({
+    ...model, model: `test-model-${index}`, label: `Model ${index}`
+  }))] }]
+  await page.goto('/web-app/')
+  const trigger = page.getByRole('button', { name: 'Choose model, current: OpenAI, GPT-6.1 Sol', exact: true })
+  await trigger.press('Enter')
+  const popup = page.getByRole('dialog', { name: 'Choose a model', exact: true })
+  const search = popup.getByRole('combobox', { name: 'Search models', exact: true })
+  await search.press('ArrowDown')
+  await expect(popup.getByRole('option', { name: 'OpenAI', exact: true })).toHaveAttribute('data-highlighted', 'true')
+  await search.press('ArrowRight')
+  await expect(popup.getByRole('listbox', { name: 'OpenAI', exact: true })).toBeVisible()
+  await search.fill('x')
+  await search.press('Backspace')
+  await expect(search).toHaveValue('')
+  await expect(popup.getByRole('listbox', { name: 'OpenAI', exact: true })).toBeVisible()
+  await search.dispatchEvent('keydown', { key: 'Backspace', isComposing: true })
+  await expect(popup.getByRole('listbox', { name: 'OpenAI', exact: true })).toBeVisible()
+  await search.press('Backspace')
+  await expect(popup.getByRole('listbox', { name: 'Models and providers', exact: true })).toBeVisible()
+  await expect(search).toBeFocused()
+  await search.press('Backspace')
+  await expect(popup).toBeVisible()
+  await search.press('ArrowDown')
+  await search.press('ArrowRight')
+  await expect(popup.getByRole('listbox', { name: 'OpenAI', exact: true })).toBeVisible()
+  await search.press('ArrowUp')
+  await expect(popup.getByRole('option', { name: 'Model 59', exact: true })).toHaveAttribute('data-highlighted', 'true')
+  await expect(search).toBeFocused()
+  expect(await popup.getByRole('option').count()).toBeLessThan(25)
+  await search.fill('Model 12')
+  await search.press('Home')
+  expect(await search.evaluate((field: HTMLInputElement) => field.selectionStart)).toBe(0)
+  await search.press('ArrowDown')
+  await search.press('Enter')
+  await expect(popup).toBeHidden()
+  await expect(page.getByRole('button', { name: 'Choose model, current: OpenAI, Model 12', exact: true })).toBeFocused()
+  const settingsTrigger = page.getByRole('button', { name: /^Model settings,/ })
+  await settingsTrigger.press('Enter')
+  const settings = page.getByRole('dialog', { name: 'Model settings', exact: true })
+  const effort = settings.getByRole('radiogroup', { name: 'Reasoning effort', exact: true })
+  await expect(effort.getByRole('radio', { name: 'High', exact: true })).toBeFocused()
+  await page.keyboard.press('Home')
+  await expect(effort.getByRole('radio', { name: 'Low', exact: true })).toBeChecked()
+  await page.keyboard.press('ArrowDown')
+  await expect(effort.getByRole('radio', { name: 'Medium', exact: true })).toBeChecked()
+  await page.keyboard.press('End')
+  await expect(effort.getByRole('radio', { name: 'High', exact: true })).toBeChecked()
+  await page.keyboard.press('Tab')
+  const tier = settings.getByRole('radiogroup', { name: 'Service tier', exact: true })
+  await expect(tier.getByRole('radio', { name: 'Auto', exact: true })).toBeFocused()
+  await page.keyboard.press('ArrowRight')
+  await expect(tier.getByRole('radio', { name: 'Normal', exact: true })).toBeChecked()
+  await page.keyboard.press('ArrowLeft')
+  await expect(tier.getByRole('radio', { name: 'Auto', exact: true })).toBeChecked()
+  await page.keyboard.press('Escape')
+  await expect(settings).toBeHidden()
+  await expect(settingsTrigger).toBeFocused()
+})
+
+for (const panel of ['models', 'settings']) {
+  test(`restores ${panel} selector focus without a pointer outline and retains keyboard outlines`, async ({ page }) => {
+    await page.goto(SESSION_URL)
+    const trigger = panel === 'models'
+      ? page.getByRole('button', { name: 'Choose model, current: OpenAI, GPT-6.1 Sol', exact: true })
+      : page.getByRole('button', { name: 'Model settings, Reasoning: High, service tier: Auto', exact: true })
+    const popup = page.getByRole('dialog', { name: panel === 'models' ? 'Choose a model' : 'Model settings', exact: true })
+
+    await trigger.click()
+    await expect(popup).toBeVisible()
+    if (panel === 'models') {
+      await popup.getByRole('combobox').fill('gpt 61')
+    }
+    await page.keyboard.press('Escape')
+    await expect(popup).toBeHidden()
+    await expect(trigger).toBeFocused()
+    await expect(trigger).toHaveCSS('outline-style', 'none')
+
+    await trigger.press('Tab')
+    await page.keyboard.press('Shift+Tab')
+    await expect(trigger).toBeFocused()
+    await expect(trigger).not.toHaveCSS('outline-style', 'none')
+    await trigger.press('Enter')
+    await expect(popup).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(popup).toBeHidden()
+    await expect(trigger).toBeFocused()
+    await expect(trigger).not.toHaveCSS('outline-style', 'none')
+  })
+}
+
+test('restores a pointer-opened session menu without an outline', async ({ page }) => {
+  await page.goto(SESSION_URL)
+  await page.getByRole('link', { name: 'Test session 0', exact: true }).hover()
+  const trigger = page.getByRole('button', { name: 'Session options', exact: true }).first()
+  await trigger.click()
+  await expect(page.getByRole('menu')).toBeVisible()
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('menu')).toBeHidden()
+  await expect(trigger).toBeFocused()
+  await expect(trigger).toHaveCSS('outline-style', 'none')
+})

@@ -1,0 +1,296 @@
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type ReactNode
+} from 'react'
+
+import { useAnimationVisibility } from '@/hooks/use-animation-visibility'
+
+import './streaming-text.sass'
+
+const CHARACTER_STAGGER_MS = 7
+const CHARACTER_REVEAL_DURATION_MS = 420
+const MAXIMUM_BATCH_CHARACTERS = 128
+const MAXIMUM_PENDING_CHARACTERS = 1_024
+const MAXIMUM_LIVE_STAGGER_MS = 120
+
+interface CharacterReveal {
+  delay: number
+  completesAt: number
+  animation?: Animation
+  animationStartTime?: number
+}
+
+interface StreamingTextProps {
+  animationId: string
+  animateInitial?: boolean
+  className?: string
+  startDelay?: number
+  text: string
+  compact?: boolean
+}
+
+interface StreamingTextState {
+  animationId: string
+  reveals: Map<number, CharacterReveal>
+  text: string
+}
+
+interface FeedAnimationProviderProps {
+  children: ReactNode
+  historicalIds?: readonly string[]
+  live?: boolean
+}
+
+interface FeedAnimationRegistry {
+  startedAnimationIds: Set<string>
+  streamedCharacterCounts: Map<string, number>
+  historicalIds: readonly string[]
+  live: boolean
+}
+
+const FeedAnimationContext = createContext<FeedAnimationRegistry | null>(null)
+
+/**
+ * Keeps wrapper cleanup from replacing nodes that belong to a native selection.
+ */
+function hasSelection(container: HTMLElement | null): boolean {
+  const selection = window.getSelection()
+
+  return Boolean(container && selection && !selection.isCollapsed &&
+    selection.containsNode(container, true))
+}
+
+export function FeedAnimationProvider({
+  children,
+  historicalIds = [],
+  live = false
+}: FeedAnimationProviderProps) {
+  const registryRef = useRef<FeedAnimationRegistry>({
+    startedAnimationIds: new Set(),
+    streamedCharacterCounts: new Map(),
+    historicalIds,
+    live
+  })
+  registryRef.current.historicalIds = historicalIds
+  registryRef.current.live = live
+
+  return (
+    <FeedAnimationContext.Provider value={registryRef.current}>
+      {children}
+    </FeedAnimationContext.Provider>
+  )
+}
+
+/**
+ * Claims a one-time feed animation while preserving that claim across
+ * virtualized unmounts.
+ */
+export function useAnimateOnce(animationId: string): boolean {
+  const registry = useContext(FeedAnimationContext)
+  const stateRef = useRef({
+    animationId,
+    shouldAnimate: !(registry?.startedAnimationIds.has(animationId) ?? false)
+  })
+
+  if (stateRef.current.animationId !== animationId) {
+    stateRef.current = {
+      animationId,
+      shouldAnimate: !(registry?.startedAnimationIds.has(animationId) ?? false)
+    }
+  }
+
+  useLayoutEffect(() => {
+    registry?.startedAnimationIds.add(animationId)
+  }, [animationId, registry])
+
+  return stateRef.current.shouldAnimate &&
+    !(registry?.historicalIds.some((id) => animationId.startsWith(id)) ?? false)
+}
+
+export function StreamingText({
+  animationId,
+  animateInitial = true,
+  className,
+  startDelay = 0,
+  text,
+  compact = false
+}: StreamingTextProps) {
+  const registry = useContext(FeedAnimationContext)
+  const canAnimate = useAnimationVisibility()
+  const containerRef = useRef<HTMLSpanElement>(null)
+  const isHistorical = registry?.historicalIds.some((id) => animationId.startsWith(id)) ?? false
+  const stateRef = useRef<StreamingTextState>({
+    animationId,
+    reveals: new Map(),
+    // Cached labels should appear immediately and only reveal subsequent changes.
+    text: animateInitial ? '' : text
+  })
+  const characters = isHistorical ? [] : Array.from(text)
+  const [, compactReveals] = useState(0)
+  const preserveSelection = !canAnimate && !isHistorical &&
+    stateRef.current.reveals.size > 0 && stateRef.current.animationId === animationId &&
+    text.startsWith(stateRef.current.text) && hasSelection(containerRef.current)
+
+  if (!canAnimate || isHistorical) {
+    // Hidden arrivals stay settled on return. Selected wrappers remain stable,
+    // but no new character animations are allocated while motion is disabled.
+    stateRef.current = {
+      animationId,
+      text,
+      reveals: preserveSelection ? stateRef.current.reveals : new Map()
+    }
+  } else if (
+    stateRef.current.animationId !== animationId ||
+    stateRef.current.text !== text
+  ) {
+    const isSameAnimation = stateRef.current.animationId === animationId
+    const continuesText = isSameAnimation && text.startsWith(stateRef.current.text)
+    const previousCharacterCount = continuesText
+      ? registry?.streamedCharacterCounts.get(animationId) ?? Array.from(stateRef.current.text).length
+      : 0
+    const now = performance.now()
+    const batchStart = Math.max(previousCharacterCount, characters.length - MAXIMUM_BATCH_CHARACTERS)
+    const reveals = new Map<number, CharacterReveal>()
+
+    if (continuesText) {
+      for (const [index, reveal] of stateRef.current.reveals) {
+        // A sliding character window must not remove a still-fading DOM node.
+        // Settled text is compacted on subsequent chunks, without timers.
+        if (reveal.completesAt > now || index >= characters.length - MAXIMUM_BATCH_CHARACTERS) {
+          reveals.set(index, reveal)
+        }
+      }
+    }
+
+    const batchSize = characters.length - batchStart
+    const stagger = registry?.live
+      ? Math.min(CHARACTER_STAGGER_MS, MAXIMUM_LIVE_STAGGER_MS / Math.max(1, batchSize - 1))
+      : CHARACTER_STAGGER_MS
+
+    // Keep pathological bursts readable without creating unbounded character DOM.
+    // Existing reveals keep their slots; excess text is rendered normally.
+    for (let index = batchStart; index < characters.length && reveals.size < MAXIMUM_PENDING_CHARACTERS; index++) {
+      const delay = (registry?.live ? 0 : startDelay) + (index - batchStart) * stagger
+      reveals.set(index, { delay, completesAt: now + delay + CHARACTER_REVEAL_DURATION_MS })
+    }
+
+    stateRef.current = {
+      animationId,
+      reveals,
+      text
+    }
+  }
+
+  if (!animateInitial && !preserveSelection) {
+    const now = performance.now()
+    // Settled labels must be plain text before a parent moves their DOM nodes.
+    for (const [index, reveal] of stateRef.current.reveals) {
+      const animation = reveal.animation
+      if (animation?.playState === 'finished' ||
+        (!animation || animation.playState === 'idle') && reveal.completesAt <= now) {
+        stateRef.current.reveals.delete(index)
+      } else if (typeof animation?.startTime === 'number') {
+        reveal.animationStartTime = animation.startTime
+      }
+    }
+  }
+
+  useLayoutEffect(() => {
+    if (animateInitial || !canAnimate) {
+      return
+    }
+
+    for (const element of containerRef.current?.querySelectorAll<HTMLElement>('[data-streaming-character-index]') ?? []) {
+      const reveal = stateRef.current.reveals.get(Number(element.dataset['streamingCharacterIndex']))
+      const animation = element.getAnimations()[0]
+      if (!reveal || !animation) {
+        continue
+      }
+
+      // A DOM move can replace a CSS animation without remounting the label.
+      // Resume only replacement animations, leaving ordinary renders untouched.
+      if (reveal.animation && reveal.animation !== animation && reveal.animationStartTime !== undefined) {
+        animation.startTime = reveal.animationStartTime
+      }
+      reveal.animation = animation
+    }
+  })
+
+  useLayoutEffect(() => {
+    if (registry === null || isHistorical) {
+      return
+    }
+
+    registry.streamedCharacterCounts.set(animationId, characters.length)
+  }, [animationId, characters.length, registry, isHistorical])
+
+  useEffect(() => {
+    if (!compact || !canAnimate || isHistorical || stateRef.current.reveals.size === 0) {
+      return undefined
+    }
+
+    // Markdown has many text leaves. Retire their finished character wrappers
+    // even when a settled block receives no further streaming updates.
+    const completesAt = Math.max(...Array.from(stateRef.current.reveals.values(), (reveal) => reveal.completesAt))
+    const timer = setTimeout(() => {
+      // Native selections can span several leaves, including their middle nodes.
+      if (hasSelection(containerRef.current)) {
+        return
+      }
+
+      stateRef.current.reveals.clear()
+      compactReveals((revision) => revision + 1)
+    }, Math.max(0, completesAt - performance.now()))
+
+    return () => clearTimeout(timer)
+  }, [animationId, text, compact, isHistorical, canAnimate])
+
+  if (isHistorical || (!canAnimate && !preserveSelection)) {
+    return (
+      <span className={className}>
+        <span className="streaming-text-characters">{text}</span>
+      </span>
+    )
+  }
+  const content: ReactNode[] = []
+  let cursor = 0
+
+  for (const [index, reveal] of stateRef.current.reveals) {
+    if (index > cursor) {
+      content.push(characters.slice(cursor, index).join(''))
+    }
+
+    content.push(
+      <span
+        key={`${animationId}:${index}-${characters[index]}`}
+        data-streaming-character-index={animateInitial ? undefined : index}
+        className="streaming-text-character-new"
+        style={{ animationDelay: `${reveal.delay}ms` }}
+      >
+        {characters[index]}
+      </span>
+    )
+    cursor = index + 1
+  }
+
+  content.push(characters.slice(cursor).join(''))
+
+  return (
+    <span
+      ref={containerRef}
+      className={className}
+      aria-label={text}
+      style={{ '--streaming-text-duration': `${CHARACTER_REVEAL_DURATION_MS}ms` } as CSSProperties}
+    >
+      <span className="streaming-text-characters" aria-hidden="true">
+        {content}
+      </span>
+    </span>
+  )
+}

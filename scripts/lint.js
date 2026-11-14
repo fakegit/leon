@@ -1,35 +1,64 @@
-import { command } from 'execa'
+import { execa } from 'execa'
 
-import log from '@/helpers/log'
-import loader from '@/helpers/loader'
+import { LogHelper } from '@/helpers/log-helper'
+import { LoaderHelper } from '@/helpers/loader-helper'
+
+import buildAurora from './build-aurora.js'
+
+// Keep full-repository results separate from staged-file and ad hoc ESLint runs.
+const ESLINT_CACHE_PATH = 'node_modules/.cache/eslint/full'
+
+const globs = [
+  'apps/web-legacy/src/js/*.{ts,js}',
+  'aurora/src/**/*.{ts,tsx,js,jsx}',
+  'apps/web/src/**/*.{ts,tsx}',
+  'apps/web/vite.config.ts',
+  'apps/web/vite/**/*.ts',
+  // TODO: deal with it once handling new hotword
+  // '"hotword/index.{ts,js}"',
+  'skills/**/*.{ts,js}',
+  'scripts/**/*.{ts,js}',
+  'bridges/runtime/**/*.ts',
+  'server/src/**/*.{ts,js}',
+  'test/**/*.{ts,tsx,js}',
+  'tools/**/*.ts'
+]
 
 /**
  * This script ensures the correct coding syntax of the whole project
  */
-(async () => {
-  loader.start()
-  log.info('Linting...')
+;(async () => {
+  LoaderHelper.start()
+  LogHelper.info('Linting...')
 
   try {
-    const globs = [
-      '"app/src/js/*.js"',
-      '"hotword/index.js"',
-      '"packages/**/*.js"',
-      '"scripts/**/*.js"',
-      '"server/src/**/*.js"',
-      '"test/*.js"',
-      '"test/e2e/**/*.js"',
-      '"test/json/**/*.js"',
-      '"test/unit/**/*.js"'
-    ]
+    await buildAurora({ quiet: true })
+    // Reuse unchanged files while still checking every TypeScript project below.
+    await execa('eslint', [
+      ...globs,
+      '--fix',
+      '--cache',
+      '--cache-strategy', 'content',
+      '--cache-location', ESLINT_CACHE_PATH,
+      '--ignore-pattern', '.gitignore'
+    ], {
+      stdio: 'inherit'
+    })
+    await execa('tsrs', ['--fast', '--noEmit', '-p', 'tsconfig.json'], {
+      stdio: 'inherit'
+    })
+    await execa('tsrs', ['--fast', '--noEmit', '-p', 'apps/web/tsconfig.json'], {
+      stdio: 'inherit'
+    })
+    await execa('tsrs', ['--fast', '--noEmit', '-p', 'test/web-app/tsconfig.json'], {
+      stdio: 'inherit'
+    })
 
-    await command(`npx eslint ${globs.join(' ')}`, { shell: true })
-
-    log.success('Looks great')
-    loader.stop()
+    LogHelper.success('Looks great')
+    LoaderHelper.stop()
   } catch (e) {
-    log.error(`Does not look great: ${e.stdout}`)
-    loader.stop()
+    LogHelper.error(`Does not look great: ${e.message}`)
+    LoaderHelper.stop()
     process.exit(1)
   }
 })()

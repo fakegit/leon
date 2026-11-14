@@ -1,0 +1,44 @@
+{
+  "$schema": "../../../schemas/skill-schemas/skill.json",
+  "name": "Have I Been Pwned",
+  "icon_name": "shield-keyhole-line",
+  "bridge": "python",
+  "version": "1.0.0",
+  "description": "Verify if one or several email addresses have been pwned (thanks to haveibeenpwned.com).",
+  "distribution": "built-in",
+  "maintenance": "official",
+  "maintainers": [
+    {
+      "name": "Louis Grenard",
+      "email": "louis@getleon.ai",
+      "github": "louistiti",
+      "discord": {
+        "username": "louistiti",
+        "id": "86842425233936384"
+      }
+    }
+  ],
+  "author": {
+    "name": "Louis Grenard",
+    "email": "louis@getleon.ai",
+    "url": "https://github.com/louistiti",
+    "github": "louistiti",
+    "discord": {
+      "username": "louistiti",
+      "id": "86842425233936384"
+    }
+  },
+  "actions": {
+    "run": {
+      "type": "logic",
+      "description": "Check whether an email address appears in known breach data.",
+      "parameters": {
+        "email": {
+          "type": "string",
+          "description": "The email address to check against breach reports."
+        }
+      },
+      "optional_parameters": ["email"]
+    }
+  }
+}

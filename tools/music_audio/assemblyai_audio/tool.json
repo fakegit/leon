@@ -1,0 +1,58 @@
+{
+  "$schema": "../../../schemas/tool-schemas/tool.json",
+  "tool_id": "assemblyai_audio",
+  "toolkit_id": "music_audio",
+  "name": "AssemblyAI Audio",
+  "version": "1.0.0",
+  "description": "A tool for audio processing using AssemblyAI's API.",
+  "icon_name": "mic-2-line",
+  "distribution": "built-in",
+  "maintenance": "official",
+  "maintainers": [
+    {
+      "name": "Louis Grenard",
+      "email": "louis@getleon.ai",
+      "github": "louistiti",
+      "discord": {
+        "username": "louistiti",
+        "id": "86842425233936384"
+      }
+    }
+  ],
+  "author": {
+    "name": "Louis Grenard",
+    "email": "louis@getleon.ai",
+    "url": "https://x.com/grenlouis",
+    "github": "louistiti",
+    "discord": {
+      "username": "louistiti",
+      "id": "86842425233936384"
+    }
+  },
+  "functions": {
+    "transcribeToFile": {
+      "description": "Transcribe audio to a file using AssemblyAI's audio transcription API.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "inputPath": {
+            "type": "string"
+          },
+          "outputPath": {
+            "type": "string"
+          },
+          "apiKey": {
+            "type": "string"
+          },
+          "speakerLabels": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "inputPath",
+          "outputPath"
+        ]
+      }
+    }
+  }
+}

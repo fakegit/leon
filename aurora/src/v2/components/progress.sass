@@ -1,0 +1,49 @@
+.aurora-progress
+  display: grid
+  gap: var(--space-sm)
+
+.aurora-progress-label
+  display: flex
+  justify-content: space-between
+  align-items: center
+  gap: var(--space-md)
+  font-size: var(--font-size-sm)
+  line-height: var(--line-height-sm)
+
+  > :last-child
+    color: var(--color-text-secondary)
+    font-variant-numeric: tabular-nums
+
+.aurora-progress-track
+  position: relative
+  height: 6px
+  overflow: hidden
+  border-radius: var(--border-radius-pill)
+  background: var(--color-border)
+
+  progress
+    position: absolute
+    inset: 0
+    width: 100%
+    height: 100%
+    margin: 0
+    opacity: 0
+    accent-color: var(--color-accent)
+
+.aurora-progress-fill
+  position: absolute
+  inset: 0 auto 0 0
+  border-radius: inherit
+  background: var(--color-accent)
+  transition: width var(--transition-duration-main) var(--transition-timing-main)
+
+@media (prefers-reduced-motion: reduce)
+  .aurora-progress-fill
+    transition: none
+
+@media (forced-colors: active)
+  .aurora-progress-track progress
+    opacity: 1
+
+  .aurora-progress-fill
+    display: none

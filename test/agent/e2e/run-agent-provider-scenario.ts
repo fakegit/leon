@@ -1,0 +1,822 @@
+import fs from 'node:fs/promises'
+import os from 'node:os'
+import path from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { once } from 'node:events'
+import { createHash } from 'node:crypto'
+import { createServer } from 'node:net'
+
+import YAML from 'yaml'
+import { resolveAgentScenario } from '../../../scripts/agent-scenarios'
+import { createCodingFixture, type CodingEvidence } from './coding-fixture'
+import { AGENT_SCENARIO_HOME_PREFIX } from '../scenario-home'
+
+import type { LLMModelReasoning } from '../../../server/src/core/llm-manager/llm-model-catalog'
+import type { AgentResponseTrace, MessageLog } from '../../../server/src/types'
+import type { Artifact } from '../../../server/src/core/artifacts/artifact-types'
+import type { AgentModelFile } from '../../../server/src/core/llm-manager/types'
+import { LLMProviders } from '../../../server/src/core/llm-manager/types'
+import type { ToolExecutionInput, ToolExecutionResult } from '../../../server/src/core/tool-manager/tool-executor'
+import type { AgentProvider } from './provider-matrix'
+import { PROVIDER_MATRIX, PROVIDER_REQUIRED_ENV } from './provider-matrix'
+import {
+  getProviderScenario,
+  type ProviderScenarioId
+} from './provider-scenarios'
+
+const RESULT_PREFIX = '__AGENT_RESULT__'
+const PROGRESS_PREFIX = '__AGENT_PROGRESS__'
+const TEST_PROFILE_PREFIX = 'agent-e2e'
+const SOURCE_CONFIG_PATH_ENV = 'LEON_AGENT_E2E_SOURCE_CONFIG_PATH'
+const SOURCE_JQ_PATH_ENV = 'LEON_AGENT_E2E_SOURCE_JQ_PATH'
+const EMPTY_PROFILE_DISABLED_CONFIG = {
+  skills: [],
+  tools: []
+}
+const AGENT_CONTINUATION_STATE_FILENAME =
+  '.agent-loop-continuation-state.json'
+const LEGACY_AGENT_HISTORY_COMPACTION_STATE_FILENAME =
+  '.react-history-compaction-state.json'
+const PROVIDER_UNAVAILABLE_PATTERNS = [
+  /cannot find llama\.cpp model/i,
+  /credit balance is too low/i,
+  /insufficient[_\s-]?quota/i,
+  /no default installed local llm was found/i,
+  /no llm is configured/i,
+  /rate limit/i,
+  /\b429\b/i
+]
+
+interface AgentProgressEvent {
+  provider: string
+  stage:
+    | 'bootstrap'
+    | 'turn_start'
+    | 'tool_call'
+    | 'turn_result'
+    | 'scenario_complete'
+    | 'cleanup'
+  turn?: number
+  message: string
+  data?: Record<string, unknown>
+}
+
+export interface AgentTurnResult {
+  input: string
+  output: string
+  finalIntent: string | null
+  executionHistory: Array<{
+    function: string
+    status: string
+    observation: string
+    stepLabel?: string
+    requestedToolInput?: string
+  }>
+  toolCalls: Array<{
+    toolkitId?: string
+    toolId: string
+    functionName?: string
+    toolInput?: string
+    parsedInput?: Record<string, unknown>
+    toolOutput?: string
+  }>
+}
+
+export interface RealScenarioTurn extends AgentTurnResult {
+  sessionId: string
+  historyBeforeTurn: number
+  progressMessages: NonNullable<AgentResponseTrace['progressMessages']>
+  responseTrace: AgentResponseTrace
+  hasExplicitMemoryWrite: boolean
+  artifacts: Artifact[]
+}
+
+/**
+ * An opt-in workflow with real agent turns and explicit external-service fixtures.
+ */
+export interface RealAgentScenario {
+  prepareProfile?(profilePath: string): Promise<void>
+  toolResult?(input: ToolExecutionInput): ToolExecutionResult | undefined
+  run(context: {
+    profilePath: string
+    runTurn(input: string, sessionId?: string, options?: { deadlineAt?: number, files?: AgentModelFile[] }): Promise<RealScenarioTurn>
+  }): Promise<Record<string, unknown>>
+}
+
+interface AgentRunnerResult {
+  provider: string
+  scenarioId: string
+  skipped: boolean
+  reason?: string
+  assetPath?: string
+  coding?: CodingEvidence
+  turn?: AgentTurnResult
+  evidence?: Record<string, unknown>
+}
+
+type ConversationLoggerRecord = Omit<MessageLog, 'sentAt'>
+
+function printResult(result: AgentRunnerResult): void {
+  /**
+   * A fixed marker makes it easy for the parent Vitest process to extract the
+   * structured result from mixed stdout/stderr.
+   */
+  console.log(`${RESULT_PREFIX}${JSON.stringify(result)}`)
+}
+
+/**
+ * Verify that successfully launched session processes actually stopped.
+ */
+function areStartedSessionsStopped(calls: AgentTurnResult['toolCalls']): boolean {
+  const pids = calls.filter((call) => call.toolId === 'shell' && call.functionName === 'startSession')
+    .map((call) => {
+      const output = JSON.parse(call.toolOutput || '{}') as {
+        data?: { output?: { result?: { success?: boolean, data?: { pid?: number } } } }
+      }
+      const result = output.data?.output?.result
+      return result?.success ? result.data?.pid : undefined
+    }).filter((pid): pid is number => typeof pid === 'number' && pid > 0)
+
+  return pids.length > 0 && pids.every((pid) => {
+    try {
+      process.kill(pid, 0)
+      return false
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ESRCH'
+    }
+  })
+}
+
+function printProgress(event: AgentProgressEvent): void {
+  console.log(`${PROGRESS_PREFIX}${JSON.stringify(event)}`)
+}
+
+function serializeToolOutput(value: unknown): string {
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
+function summarizeValue(value: string, maxLength = 220): string {
+  if (value.length <= maxLength) {
+    return value
+  }
+
+  return `${value.slice(0, maxLength)}...`
+}
+
+function createConversationLoggerRecord(
+  who: MessageLog['who'],
+  message: string
+): ConversationLoggerRecord {
+  return {
+    who,
+    message,
+    isAddedToHistory: true
+  }
+}
+
+function getProviderUnavailableReason(value: unknown): string | null {
+  const message =
+    value instanceof Error
+      ? `${value.name}: ${value.message}\n${value.stack || ''}`
+      : String(value || '')
+
+  if (
+    PROVIDER_UNAVAILABLE_PATTERNS.some((pattern) => pattern.test(message))
+  ) {
+    return summarizeValue(message.replace(/\s+/g, ' ').trim(), 500)
+  }
+
+  return null
+}
+
+async function prepareTestProfilePath(
+  directories: string[],
+  disabledConfigPath: string
+): Promise<void> {
+  await Promise.all(
+    directories.map((directory) => fs.mkdir(directory, { recursive: true }))
+  )
+
+  await fs.writeFile(
+    disabledConfigPath,
+    `${JSON.stringify(EMPTY_PROFILE_DISABLED_CONFIG, null, 2)}\n`,
+    'utf8'
+  )
+}
+
+/**
+ * Allocate a local service port so isolated profiles never call the owner runtime.
+ */
+async function getTestServerPort(): Promise<number> {
+  const server = createServer()
+  const listening = once(server, 'listening')
+  server.listen(0, '127.0.0.1')
+  await listening
+
+  const address = server.address()
+  if (!address || typeof address === 'string') {
+    throw new Error('Could not allocate the scenario service port')
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error)
+        return
+      }
+
+      resolve()
+    })
+  })
+
+  return address.port
+}
+
+/**
+ * Seeds an isolated profile from the active profile configuration.
+ */
+async function prepareTestProfileConfig(
+  sourceConfigPath: string,
+  targetConfigPath: string,
+  llmTarget: string,
+  reasoning: LLMModelReasoning | null,
+  useProfileModel = false
+): Promise<void> {
+  if (!sourceConfigPath || !await fs.stat(sourceConfigPath).then(
+    (stat) => stat.isFile(),
+    () => false
+  )) {
+    throw new Error(
+      `The source profile configuration does not exist: ${sourceConfigPath || '(missing path)'}`
+    )
+  }
+
+  const sourceConfig = await fs.readFile(sourceConfigPath, 'utf8')
+  const document = YAML.parseDocument(sourceConfig)
+
+  if (document.errors.length > 0) {
+    throw new Error(
+      `The source profile configuration is invalid: ${document.errors.join('; ')}`
+    )
+  }
+
+  // Use the selected target while preserving its profile model settings.
+  document.setIn(['server', 'port'], await getTestServerPort())
+  document.setIn(['llm', 'default'], llmTarget)
+  document.setIn(['llm', 'workflow'], null)
+  document.setIn(['llm', 'agent'], null)
+
+  if (useProfileModel && llmTarget.split('/')[0] === LLMProviders.LlamaCPP) {
+    // The inference service must stay separate from the owner's warm runtime.
+    document.setIn(['llm', 'providers', LLMProviders.LlamaCPP, 'base_url'],
+      `http://127.0.0.1:${await getTestServerPort()}/v1`)
+  }
+
+  if (!useProfileModel) {
+    // Provider matrix tests explicitly select an API-key-backed target.
+    document.deleteIn(['llm', 'providers', llmTarget.split('/')[0], 'account'])
+  }
+
+  if (reasoning) {
+    document.setIn(
+      ['llm', 'model_settings', llmTarget, 'reasoning'],
+      reasoning
+    )
+  }
+
+  await fs.mkdir(path.dirname(targetConfigPath), { recursive: true })
+  await fs.writeFile(targetConfigPath, String(document), { mode: 0o600 })
+
+  if (useProfileModel) {
+    // Copy authentication into the disposable profile, never owner memory or history.
+    // Account refreshes and generated tokens must stay in the test profile.
+    const sourceProfile = path.dirname(sourceConfigPath)
+    const targetProfile = path.dirname(targetConfigPath)
+
+    for (const relativePath of ['.env', 'connections/llm-accounts']) {
+      const source = path.join(sourceProfile, relativePath)
+
+      try {
+        await fs.cp(source, path.join(targetProfile, relativePath), {
+          recursive: true
+        })
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw error
+        }
+      }
+    }
+  }
+}
+
+async function main(): Promise<void> {
+  const providerArg = process.argv[2] as AgentProvider | undefined
+  const scenarioArg = process.argv[3]
+  let realScenario: RealAgentScenario | null = null
+  let realScenarioPath: string | undefined
+  if (process.argv.includes('--real-scenario')) {
+    realScenarioPath = pathToFileURL(resolveAgentScenario(scenarioArg || '')).href
+  }
+  const isRealScenario = realScenarioPath !== undefined
+  const scenario = isRealScenario
+    ? { id: scenarioArg as string, buildInput: (): string => '' }
+    : getProviderScenario(scenarioArg)
+  const resultScenarioId = (scenarioArg || 'direct_answer') as ProviderScenarioId
+
+  if (!providerArg || (!isRealScenario && !(providerArg in PROVIDER_REQUIRED_ENV)) || !scenario) {
+    printResult({
+      provider: (providerArg || 'openai') as AgentProvider,
+      scenarioId: resultScenarioId,
+      skipped: true,
+      reason: !scenario ? 'invalid_scenario' : 'invalid_provider'
+    })
+    return
+  }
+
+  const provider = providerArg
+  const providerConfig = PROVIDER_MATRIX.find(
+    (item) => item.provider === provider
+  )
+  const llmTarget = isRealScenario
+    ? process.env['LEON_AGENT_SCENARIO_TARGET'] || ''
+    : providerConfig?.llmTarget || provider
+  if (!llmTarget) {
+    throw new Error('No active profile model was selected for the scenario.')
+  }
+  const requiredEnv = PROVIDER_REQUIRED_ENV[provider]
+  // Nested source identifiers must never become profile path components.
+  const profileScenarioId = isRealScenario
+    ? createHash('sha256').update(scenario.id).digest('hex').slice(0, 12)
+    : scenario.id
+  const testRunId = `${provider}-${profileScenarioId}-${process.pid}-${Date.now()}`
+  const testProfileName = `${TEST_PROFILE_PREFIX}-${testRunId}`
+  const testHomePath = process.env['LEON_AGENT_SCENARIO_HOME']
+  if (!testHomePath || path.dirname(path.resolve(testHomePath)) !== path.resolve(os.tmpdir()) ||
+      !path.basename(testHomePath).startsWith(AGENT_SCENARIO_HOME_PREFIX)) {
+    throw new Error('Agent scenarios require an isolated temporary Leon home.')
+  }
+  const testProfilePath = path.join(
+    testHomePath,
+    'profiles',
+    testProfileName
+  )
+  const testConfigPath = path.join(testProfilePath, 'config.yml')
+  if (!isRealScenario && !process.env[requiredEnv]) {
+    printResult({
+      provider,
+      scenarioId: scenario.id,
+      skipped: true,
+      reason: `missing_${requiredEnv.toLowerCase()}`
+    })
+    return
+  }
+
+  process.env['LEON_NODE_ENV'] = 'testing'
+  process.env['LEON_LLM'] = llmTarget
+  process.env['LEON_HOME'] = testHomePath
+  process.env['LEON_PROFILE'] = testProfileName
+  delete process.env['LEON_PROFILE_TOKEN']
+
+  await prepareTestProfileConfig(
+    String(process.env[SOURCE_CONFIG_PATH_ENV] || '').trim(),
+    testConfigPath,
+    llmTarget,
+    isRealScenario ? null : providerConfig?.reasoning || null,
+    isRealScenario
+  )
+
+  // Scenario imports may resolve environment-derived Core paths. Load them only
+  // after the disposable profile is configured, never in the owner environment.
+  if (realScenarioPath) {
+    realScenario = (await import(realScenarioPath)).default as RealAgentScenario
+  }
+
+  const tempAssetPath = path.join(
+    os.tmpdir(),
+    `leon-agent-${provider}-${profileScenarioId}-${Date.now()}.txt`
+  )
+
+  const {
+    CACHE_PATH,
+    LEON_PROFILE_PATH,
+    LEON_PROFILES_PATH,
+    LEON_HOME_PATH,
+    LEON_TOOLKITS_PATH,
+    MODELS_PATH,
+    PROFILE_AGENT_SKILLS_PATH,
+    PROFILE_CONTEXT_PATH,
+    PROFILE_DISABLED_PATH,
+    PROFILE_LOGS_PATH,
+    PROFILE_MEMORY_PATH,
+    PROFILE_NATIVE_SKILLS_PATH,
+    PROFILE_SKILLS_PATH,
+    PROFILE_TOOLS_PATH,
+    TMP_PATH
+  } = await import('../../../server/src/constants')
+
+  // Refuse fixture writes if any earlier dependency loaded owner-owned Core roots.
+  if (path.resolve(LEON_HOME_PATH) !== path.resolve(testHomePath) ||
+      path.resolve(LEON_PROFILE_PATH) !== path.resolve(testProfilePath)) {
+    throw new Error('Core was loaded before the isolated scenario profile was configured.')
+  }
+
+  // Retained-output queries need the managed binary in the isolated home too.
+  const { RuntimeHelper } = await import('../../../server/src/helpers/runtime-helper')
+  const sourceJQPath = String(process.env[SOURCE_JQ_PATH_ENV] || '').trim()
+  const testJQPath = RuntimeHelper.getJQBinPath()
+  await fs.mkdir(path.dirname(testJQPath), { recursive: true })
+  await fs.copyFile(sourceJQPath, testJQPath)
+
+  await prepareTestProfilePath(
+    [
+      LEON_HOME_PATH,
+      LEON_PROFILES_PATH,
+      LEON_PROFILE_PATH,
+      CACHE_PATH,
+      LEON_TOOLKITS_PATH,
+      MODELS_PATH,
+      TMP_PATH,
+      PROFILE_CONTEXT_PATH,
+      PROFILE_MEMORY_PATH,
+      PROFILE_LOGS_PATH,
+      PROFILE_SKILLS_PATH,
+      PROFILE_NATIVE_SKILLS_PATH,
+      PROFILE_AGENT_SKILLS_PATH,
+      PROFILE_TOOLS_PATH
+    ],
+    PROFILE_DISABLED_PATH
+  )
+  await realScenario?.prepareProfile?.(testProfilePath)
+
+  const continuationStatePath = path.join(
+    PROFILE_CONTEXT_PATH,
+    AGENT_CONTINUATION_STATE_FILENAME
+  )
+  const historyCompactionStatePath = path.join(
+    PROFILE_CONTEXT_PATH,
+    LEGACY_AGENT_HISTORY_COMPACTION_STATE_FILENAME
+  )
+
+  // Keep the instruction-following fixture bounded and independent of the
+  // owner's repository size, so it tests reading and listing rather than export.
+  const instructionProjectPath = path.join(testHomePath, 'instruction-project')
+  await fs.mkdir(instructionProjectPath, { recursive: true })
+  await Promise.all([
+    fs.writeFile(path.join(instructionProjectPath, 'README.md'), '# Fixture project\n'),
+    fs.writeFile(path.join(instructionProjectPath, 'package.json'), '{"private":true}\n')
+  ])
+  await fs.writeFile(
+    tempAssetPath,
+    `Please list the files in this exact project root directory: ${instructionProjectPath}.\n`,
+    'utf8'
+  )
+
+  const {
+    ReActLLMDuty
+  } = await import('../../../server/src/core/llm-manager/llm-duties/react-llm-duty')
+  const { CONVERSATION_LOGGER, TOOL_EXECUTOR, LLM_PROVIDER, TOOL_WORKER_MANAGER, HTTP_SERVER } = await import(
+    '../../../server/src/core/index'
+  )
+  // These subprocesses bypass the server's signal handlers. Dispose native
+  // providers before exiting so an interrupted GUI test cannot orphan overlays.
+  const stop = (): void => {
+    void TOOL_WORKER_MANAGER.dispose().finally(() => process.exit(130))
+  }
+  process.once('SIGINT', stop)
+  process.once('SIGTERM', stop)
+  const { CONFIG_STATE } = await import(
+    '../../../server/src/core/config-states/config-state'
+  )
+  const { runWithConversationSession, getActiveConversationSessionId } = await import(
+    '../../../server/src/core/session-manager/session-context'
+  )
+
+  const codingFixture = !realScenario && scenario.id.startsWith('coding_')
+    ? await createCodingFixture(path.join(testHomePath, 'repository'), scenario.id as ProviderScenarioId)
+    : null
+  const input = scenario.buildInput(codingFixture?.root || tempAssetPath)
+  const toolCalls: AgentTurnResult['toolCalls'] = []
+  const toolCallSessions = new Map<AgentTurnResult['toolCalls'][number], ReturnType<typeof getActiveConversationSessionId>>()
+  type ExecuteTool = typeof TOOL_EXECUTOR.executeTool
+  type ToolExecutionInput = Parameters<ExecuteTool>[0]
+  type ToolExecutionResult = Awaited<ReturnType<ExecuteTool>>
+
+  const originalExecuteTool = TOOL_EXECUTOR.executeTool.bind(
+    TOOL_EXECUTOR
+  ) as ExecuteTool
+
+  /**
+   * Wrap tool execution so the parent spec can assert on real tool usage
+   * without changing the production agent path.
+   */
+  TOOL_EXECUTOR.executeTool = async (
+    input: ToolExecutionInput
+  ): Promise<ToolExecutionResult> => {
+    // Retained dispatch re-enters the executor for native work. Record the
+    // originating agent call once rather than counting that internal handoff.
+    if (input.retainExecution === false) {
+      return originalExecuteTool(input)
+    }
+
+    const toolResult = realScenario?.toolResult?.(input) ?? await originalExecuteTool(input)
+    const toolName = `${input.toolkitId}.${input.toolId}.${input.functionName || 'unknown'}`
+    const serializedInput = input.toolInput || ''
+    const serializedOutput = serializeToolOutput(toolResult)
+    const toolCall: AgentTurnResult['toolCalls'][number] = {
+      toolId: input.toolId,
+      toolOutput: serializedOutput
+    }
+
+    if (input.toolkitId !== undefined) {
+      toolCall.toolkitId = input.toolkitId
+    }
+
+    if (input.functionName !== undefined) {
+      toolCall.functionName = input.functionName
+    }
+
+    if (input.toolInput !== undefined) {
+      toolCall.toolInput = input.toolInput
+    }
+
+    if (input.parsedInput && typeof input.parsedInput === 'object') {
+      toolCall.parsedInput = { ...input.parsedInput }
+    }
+
+    printProgress({
+      provider,
+      stage: 'tool_call',
+      message: `Executed ${toolName}`,
+      data: {
+        toolName,
+        toolInput: summarizeValue(serializedInput),
+        toolOutput: summarizeValue(serializedOutput)
+      }
+    })
+
+    toolCalls.push(toolCall)
+    toolCallSessions.set(toolCall, getActiveConversationSessionId())
+
+    return toolResult
+  }
+
+  let scenarioFailed = false
+
+  async function cleanup(): Promise<void> {
+    const workerCleanupStartedAt = performance.now()
+    await TOOL_WORKER_MANAGER.dispose()
+    printProgress({ provider, stage: 'cleanup', message:
+      `Tool worker cleanup: ${Math.round(performance.now() - workerCleanupStartedAt)} ms` })
+    const httpCleanupStartedAt = performance.now()
+    if (HTTP_SERVER.httpServer.listening) {
+      await new Promise<void>((resolve, reject) => {
+        HTTP_SERVER.httpServer.close((error) => {
+          if (error) {
+            reject(error)
+            return
+          }
+
+          resolve()
+        })
+      })
+    }
+    printProgress({ provider, stage: 'cleanup', message:
+      `HTTP cleanup: ${Math.round(performance.now() - httpCleanupStartedAt)} ms` })
+    process.removeListener('SIGINT', stop)
+    process.removeListener('SIGTERM', stop)
+    TOOL_EXECUTOR.executeTool = originalExecuteTool
+    const fileCleanupStartedAt = performance.now()
+    await CONVERSATION_LOGGER.clear()
+    await fs.rm(tempAssetPath, { force: true })
+    await fs.rm(continuationStatePath, { force: true })
+    await fs.rm(historyCompactionStatePath, { force: true })
+    printProgress({ provider, stage: 'cleanup', message:
+      `Fixture file cleanup: ${Math.round(performance.now() - fileCleanupStartedAt)} ms` })
+  }
+
+  try {
+    const { default: generateProfileToken } = await import(
+      '../../../scripts/generate/generate-profile-token.js'
+    )
+    await generateProfileToken()
+
+    // Retained executions and provider-backed tools use the profile's own API.
+    const listening = once(HTTP_SERVER.httpServer, 'listening')
+    await HTTP_SERVER.init()
+    await listening
+
+    /**
+     * The e2e subprocess bypasses the normal server bootstrap, so initialize
+     * the selected provider explicitly before the first agent turn.
+     */
+    const isProviderInitialized = await LLM_PROVIDER.init()
+    if (!isProviderInitialized) {
+      const target = CONFIG_STATE.getModelState().getAgentTarget()
+      throw new Error(
+        target.resolutionError ||
+          `Could not initialize provider "${provider}" with target "${llmTarget}".`
+      )
+    }
+    printProgress({
+      provider,
+      stage: 'bootstrap',
+      message: `Initialized provider ${provider}`,
+      data: {
+        assetPath: tempAssetPath
+      }
+    })
+    await CONVERSATION_LOGGER.clear()
+    await fs.rm(continuationStatePath, { force: true })
+    await fs.rm(historyCompactionStatePath, { force: true })
+
+    if (realScenario) {
+      const { CONVERSATION_SESSION_MANAGER } = await import('../../../server/src/core/session-manager')
+      let turnNumber = 0
+      const evidence = await realScenario.run({
+        profilePath: testProfilePath,
+        runTurn: async (ownerInput, existingSessionId, options = {}) => {
+          const sessionId = existingSessionId || CONVERSATION_SESSION_MANAGER.createSession().id
+          return runWithConversationSession({ sessionId }, async () => {
+            const historyBeforeTurn = (await CONVERSATION_LOGGER.loadAll({ sessionId })).length
+            const callOffset = toolCalls.length
+            const currentTurn = ++turnNumber
+            printProgress({ provider, stage: 'turn_start', turn: currentTurn, message: scenario.id, data: { input: ownerInput } })
+            await CONVERSATION_LOGGER.push(createConversationLoggerRecord('owner', ownerInput))
+            const progressMessages: RealScenarioTurn['progressMessages'] = []
+            const duty = new ReActLLMDuty({
+              input: ownerInput,
+              ...options,
+              onProgressEvent: (event): void => {
+                if (event.type === 'progress_message') {
+                  progressMessages.push(structuredClone(event.message))
+                }
+              }
+            })
+            await duty.init({ force: true })
+            const { collectArtifacts } = await import('@/core/artifacts/artifact-context')
+            const { value: result, artifacts } = await collectArtifacts(() => duty.execute())
+            if (!result) {
+              throw new Error('Agent scenario returned no result.')
+            }
+            const output = typeof result.output === 'string' ? result.output : ''
+            const turn: RealScenarioTurn = {
+              sessionId, historyBeforeTurn, input: ownerInput, output,
+              progressMessages, artifacts,
+              responseTrace: result.data?.['agentResponseTrace'] as AgentResponseTrace,
+              hasExplicitMemoryWrite: result.data?.['hasExplicitMemoryWrite'] === true,
+              finalIntent: typeof result.data?.['finalIntent'] === 'string' ? result.data['finalIntent'] : null,
+              executionHistory: Array.isArray(result.data?.['executionHistory'])
+                ? result.data['executionHistory'] as AgentTurnResult['executionHistory'] : [],
+              toolCalls: toolCalls.slice(callOffset).filter((call) => toolCallSessions.get(call) === sessionId)
+            }
+            await CONVERSATION_LOGGER.push({ ...createConversationLoggerRecord('leon', output),
+              ...(turn.responseTrace.id ? { messageId: turn.responseTrace.id } : {}),
+              agentResponseTrace: turn.responseTrace
+            })
+            printProgress({ provider, stage: 'turn_result', turn: currentTurn, message: scenario.id, data: { output, finalIntent: turn.finalIntent } })
+            return turn
+          })
+        }
+      })
+      printResult({ provider, scenarioId: scenario.id, skipped: false, evidence })
+      return
+    }
+
+    printProgress({
+      provider,
+      stage: 'turn_start',
+      turn: 1,
+      message: `Starting ${scenario.id}`,
+      data: { input }
+    })
+
+    const { CONVERSATION_SESSION_MANAGER } = await import('../../../server/src/core/session-manager')
+    CONVERSATION_SESSION_MANAGER.createSession(testRunId)
+    await CONVERSATION_LOGGER.push(
+      createConversationLoggerRecord('owner', input)
+    )
+
+    const result = await runWithConversationSession({ sessionId: testRunId }, async () => {
+      const duty = new ReActLLMDuty({ input })
+      await duty.init({ force: true })
+      return duty.execute()
+    })
+
+    if (!result) {
+      throw new Error(
+        `Agent scenario "${scenario.id}" returned no result for provider "${provider}".`
+      )
+    }
+
+    const output = typeof result.output === 'string' ? result.output : ''
+    const finalIntent =
+      result.data &&
+      typeof result.data === 'object' &&
+      'finalIntent' in result.data &&
+      typeof result.data['finalIntent'] === 'string'
+        ? result.data['finalIntent']
+        : null
+    const turn: AgentTurnResult = {
+      input,
+      output,
+      finalIntent,
+      executionHistory:
+        result.data &&
+        typeof result.data === 'object' &&
+        Array.isArray(result.data['executionHistory'])
+          ? (result.data['executionHistory'] as AgentTurnResult['executionHistory'])
+          : [],
+      toolCalls
+    }
+
+    if (finalIntent === 'error') {
+      const providerUnavailableReason = getProviderUnavailableReason(output)
+
+      if (providerUnavailableReason) {
+        printResult({
+          provider,
+          scenarioId: scenario.id,
+          skipped: true,
+          reason: providerUnavailableReason,
+          assetPath: tempAssetPath,
+          turn
+        })
+        return
+      }
+    }
+
+    printProgress({
+      provider,
+      stage: 'turn_result',
+      turn: 1,
+      message: `Completed ${scenario.id}`,
+      data: {
+        finalIntent,
+        output: summarizeValue(output),
+        toolCalls: toolCalls.length
+      }
+    })
+
+    printResult({
+      provider,
+      scenarioId: scenario.id,
+      skipped: false,
+      assetPath: tempAssetPath,
+      ...(codingFixture ? {
+        coding: {
+          ...await codingFixture.verify(),
+          ...(scenario.id === 'coding_session' ? {
+            sessionsStopped: areStartedSessionsStopped(toolCalls)
+          } : {})
+        }
+      } : {}),
+      turn
+    })
+    printProgress({
+      provider,
+      stage: 'scenario_complete',
+      message: `Completed ${scenario.id}`,
+      data: {
+        scenarioId: scenario.id
+      }
+    })
+  } catch (error) {
+    scenarioFailed = true
+    throw error
+  } finally {
+    await cleanup().catch((error: unknown) => {
+      if (!scenarioFailed) {
+        throw error
+      }
+
+      // Keep the task failure as the result while retaining shutdown diagnostics.
+      console.error('Scenario cleanup failed:', error)
+    })
+  }
+}
+
+void main()
+  .then(() => {
+    /**
+     * Core singletons keep background handles open, so exit explicitly once the
+     * structured result has been printed and cleanup has finished.
+     */
+    process.exit(0)
+  })
+  .catch((error) => {
+    const provider = (process.argv[2] || 'openai') as AgentProvider
+    const scenarioId = (process.argv[3] || 'direct_answer') as ProviderScenarioId
+    const providerUnavailableReason = getProviderUnavailableReason(error)
+
+    printResult({
+      provider,
+      scenarioId,
+      skipped: Boolean(providerUnavailableReason),
+      reason: providerUnavailableReason || String(error)
+    })
+    process.exit(providerUnavailableReason ? 0 : 1)
+  })

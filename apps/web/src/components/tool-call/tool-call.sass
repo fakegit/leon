@@ -1,0 +1,233 @@
+.tool-call
+  position: relative
+  min-width: 0
+
+  > .aurora-surface
+    margin-block: var(--space-sm)
+
+.tool-call-trigger
+  display: flex
+  align-items: center
+  gap: var(--space-sm)
+  width: auto
+  max-width: 100%
+  padding: 0
+  color: var(--color-text-secondary)
+  font-size: var(--font-size-md)
+  line-height: var(--line-height-md)
+  text-align: left
+
+  &:hover:not(:has(.activity-wave-active))
+    color: var(--color-text)
+
+  &:hover
+    .tool-call-chevron
+      opacity: 1
+
+  &[aria-expanded='true']
+    .tool-call-chevron
+      opacity: 1
+      transform: rotate(90deg)
+
+  &:focus-visible
+    outline: 1px solid var(--color-accent)
+    outline-offset: var(--space-xs)
+
+.tool-call-label,
+.tool-call-heading-layer
+  display: flex
+  align-items: center
+  gap: var(--space-sm)
+  min-width: 0
+
+.tool-call-heading-layer
+  flex: 1 1 auto
+  color: inherit
+  transition: color var(--transition-duration-main) var(--transition-timing-main)
+
+.tool-call-tool-icon
+  display: inline-flex
+  flex: 0 0 auto
+  align-items: center
+  justify-content: center
+  width: var(--tool-call-marker-size)
+  height: var(--tool-call-marker-size)
+  color: currentColor
+  font-size: var(--font-size-md)
+  line-height: 1
+
+.tool-call-title
+  flex: 1 1 auto
+  min-width: 0
+  overflow: hidden
+  text-overflow: ellipsis
+  white-space: nowrap
+  color: currentColor
+
+.tool-call-heading
+  display: flex
+  align-items: center
+  gap: var(--space-sm)
+  min-width: 0
+
+.tool-call-error-indicator
+  // Match the optical alignment of the duration and disclosure icon.
+  position: relative
+  top: 1px
+  display: inline-flex
+  flex: 0 0 auto
+  align-items: center
+  color: var(--color-danger)
+  font-size: var(--font-size-sm)
+  line-height: 1
+
+.tool-call-chevron
+  position: relative
+  top: 1px
+  flex: 0 0 auto
+  opacity: 0
+  font-size: var(--font-size-xl)
+  line-height: 1
+  color: currentColor
+  transform: rotate(0deg)
+  transform-origin: center
+  transition: color var(--transition-duration-main) var(--transition-timing-main), opacity var(--transition-duration-main) var(--transition-timing-main), transform var(--transition-duration-main) var(--transition-timing-main)
+
+.tool-output
+  position: relative
+  min-width: 0
+  min-height: 0
+
+.tool-output-markdown
+  height: 236px
+
+.tool-output-document-source
+  display: flex
+  flex-direction: column
+
+  > .code-view
+    flex: 1 1 auto
+
+  > .tool-diff-notice
+    flex: 0 0 auto
+
+.tool-output-markdown-viewport
+  padding: var(--space-md) var(--space-lg)
+  font-size: var(--font-size-md)
+  line-height: var(--line-height-md)
+  overscroll-behavior: contain
+
+.tool-output-markdown-preview
+  height: auto
+  max-height: calc(var(--code-preview-lines) * 22px + var(--space-md) * 2)
+
+  .tool-output-markdown-viewport
+    max-height: inherit
+    overflow-y: hidden
+    overscroll-behavior-y: auto
+
+.tool-output-ellipsis
+  margin: 0
+  color: var(--color-text-tertiary)
+
+.tool-output-loading
+  position: absolute
+  inset: 0
+  display: flex
+  align-items: center
+  justify-content: center
+
+.tool-details-tabs
+  display: flex
+  gap: var(--space-xs)
+
+.tool-details-tab[aria-selected='true']
+  --button-background: var(--color-surface-hover)
+  color: var(--color-text)
+
+.tool-diff
+  display: flex
+  flex-direction: column
+  min-width: 0
+  height: 100%
+
+.tool-changes
+  display: flex
+  flex-direction: column
+  height: 236px
+
+  &:not(.tool-changes-preview) > .tool-output
+    flex: 1 1 auto
+    min-height: 0
+
+    .code-view
+      height: 100%
+
+.tool-changes-preview
+  height: auto
+  max-height: calc((var(--code-preview-lines) + 1) * 22px + 80px)
+  overflow: clip
+
+  .tool-diff
+    height: auto
+
+.tool-diff-preview-body
+  flex: 1 1 auto
+  min-height: 0
+  overflow: clip
+
+.tool-diff-labels
+  display: flex
+  gap: var(--space-lg)
+  padding: var(--space-sm) var(--space-lg)
+  color: var(--color-text-tertiary)
+  font-size: var(--font-size-xs)
+  border-bottom: 1px solid var(--color-border)
+
+  span
+    flex: 1
+
+.tool-diff-header
+  display: flex
+  align-items: center
+  justify-content: space-between
+  gap: var(--space-sm)
+  padding: var(--space-sm) var(--space-lg) 0
+
+  .tooltip
+    flex: 0 0 auto
+
+.tool-diff-views
+  display: flex
+  flex: 0 0 auto
+  gap: var(--space-xs)
+
+.tool-diff-filename
+  min-width: 0
+  margin: 0
+  overflow-wrap: anywhere
+  color: var(--color-text-tertiary)
+  font-family: var(--font-family-code)
+  font-size: var(--font-size-xs)
+
+.tool-diff-scroll
+  flex: 1 1 auto
+
+.tool-diff-notice
+  margin: 0
+  padding: var(--space-sm) var(--space-lg)
+  color: var(--color-text-tertiary)
+  font-size: var(--font-size-xs)
+
+.tool-diff-ellipsis
+  flex: 0 0 auto
+  margin: 0
+  padding: 0 var(--space-lg)
+  color: var(--color-text-tertiary)
+  font-family: var(--font-family-code)
+  line-height: 22px
+
+@media (prefers-reduced-motion: reduce)
+  .tool-call-heading-layer,
+  .tool-call-chevron
+    transition: none

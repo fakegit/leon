@@ -1,0 +1,380 @@
+import { Icon } from '@/components/icon'
+import { MemoryDetails } from '@/components/activity-details/memory-details'
+import { clsx } from 'clsx'
+import { lazy, memo, Suspense } from 'react'
+import { Loader } from '@/components/loader'
+
+import type {
+  FeedPlanActivity,
+  FeedToolCall,
+  FeedToolsActivity,
+  LeonFeedActivity,
+  LeonFeedEntry
+} from '@/data/feed'
+import { FeedTurnStatus, isToolCallVisible } from '@/data/feed'
+import { DurationFormat, formatToolDuration } from '@/utils/format-tool-duration'
+import { BonusResponse } from '@/components/bonus-response'
+import { FinalAnswer } from '@/components/final-answer'
+import { SkillDetails } from '@/components/activity-details/skill-details'
+import { ProcessGroup } from '@/components/process-group'
+import { useAnimateOnce } from '@/components/streaming-text'
+import { MarkdownContent } from '@/components/markdown-content'
+import { TaskList } from '@/components/task-list'
+import { ThinkingMessage } from '@/components/thinking-message'
+import { ToolCallList } from '@/components/tool-call-list'
+import { WorkingMessage } from '@/components/working-message'
+import { ActivityTimestamp } from '@/components/activity-timestamp'
+
+import './leon-message.sass'
+
+const ConnectionSetupCard = lazy(() => import('@/components/connection-setup/connection-setup'))
+
+/**
+ * Collects call-owned widgets outside activity disclosures, including planned calls.
+ */
+function getPreparations(activities: LeonFeedActivity[]): { id: string, preparation: NonNullable<FeedToolCall['preparation']> }[] {
+  const preparations = new Map<string, NonNullable<FeedToolCall['preparation']>>()
+
+  function visit(items: LeonFeedActivity[]): void {
+    for (const activity of items) {
+      const calls = activity.type === 'tools' ? activity.toolCalls
+        : activity.type === 'plan' ? activity.steps.flatMap((step) => step.toolCalls) : []
+
+      for (const call of calls) {
+        if (call.preparation) {
+          preparations.set(call.id, call.preparation)
+        }
+      }
+
+      if (activity.type === 'plan') {
+        for (const step of activity.steps) {
+          visit(step.activities ?? [])
+        }
+      }
+    }
+  }
+
+  visit(activities)
+
+  return Array.from(preparations, ([id, preparation]) => ({ id, preparation }))
+}
+
+interface LeonMessageProps {
+  entry: LeonFeedEntry
+}
+
+interface ExecutionActivityProps {
+  activity: FeedPlanActivity | FeedToolsActivity
+}
+
+/**
+ * Sums recorded execution time without including gaps between tool calls.
+ * This is cumulative work, not wall-clock time when calls run concurrently.
+ * Incomplete timing cannot reliably describe the whole group.
+ */
+function getToolGroupDuration(toolCalls: FeedToolCall[]): number | undefined {
+  let duration = 0
+
+  for (const call of toolCalls) {
+    if (
+      call.durationMs === undefined || !Number.isFinite(call.durationMs) || call.durationMs < 0
+    ) {
+      return undefined
+    }
+
+    duration += call.durationMs
+  }
+
+  return toolCalls.length > 0 && Number.isFinite(duration) ? duration : undefined
+}
+
+function ExecutionActivity({ activity }: ExecutionActivityProps) {
+  const shouldAnimate = useAnimateOnce(`${activity.id}:execution`)
+
+  if (activity.type === 'plan') {
+    const planDuration = formatToolDuration(activity.durationMs, DurationFormat.Compact)
+    const planIsActive = activity.steps.some((step) =>
+      step.status === 'in_progress' || step.status === 'pending'
+    )
+
+    return (
+      <div className={clsx('leon-message-execution', {
+        'leon-message-execution-animate': shouldAnimate
+      })}>
+        <ProcessGroup
+          active={planIsActive}
+          activeLabel="Executing plan..."
+          ariaLabel="Leon’s execution plan"
+          className="activity-timeline-parent"
+          completedLabel={(activity.complete ?? activity.steps.every((step) => step.status === 'completed'))
+            ? `Completed plan${planDuration ? ` for ${planDuration}` : ''}` : 'Execution plan'}
+          indicator={<Icon name="map-2-line" />}
+        >
+          <TaskList steps={activity.steps} renderActivity={renderActivity} />
+        </ProcessGroup>
+      </div>
+    )
+  }
+
+  const toolsAreActive = activity.toolCalls.some((toolCall) =>
+    toolCall.status === 'preparing' || toolCall.status === 'running'
+  )
+  const toolsAreRunning = activity.toolCalls.some((toolCall) =>
+    toolCall.status === 'running'
+  )
+  const hasVisibleToolCalls = activity.toolCalls.some(isToolCallVisible)
+  const toolCount = activity.toolCalls.length
+  const duration = formatToolDuration(getToolGroupDuration(activity.toolCalls), DurationFormat.Compact)
+
+  return (
+    <div className={clsx('leon-message-execution', {
+      'leon-message-execution-animate': shouldAnimate
+    })}>
+      <ProcessGroup
+        active={toolsAreActive}
+        animateWhileActive={!hasVisibleToolCalls}
+        activeLabel={toolsAreRunning ? 'Using tools...' : 'Preparing tool calls...'}
+        ariaLabel="Leon’s tool usage"
+        className="activity-timeline-parent"
+        completedLabel={`Used ${toolCount} ${
+          toolCount === 1 ? 'tool' : 'tools'
+        }${duration ? ` for ${duration}` : ''}`}
+        indicator={(
+          <Icon name="pencil-ruler-2-line" />
+        )}
+      >
+        {hasVisibleToolCalls ? <ToolCallList toolCalls={activity.toolCalls} /> : undefined}
+      </ProcessGroup>
+    </div>
+  )
+}
+
+function renderActivity(activity: LeonFeedActivity) {
+  if (activity.type === 'compaction') {
+    const duration = formatToolDuration(activity.durationMs, DurationFormat.Compact)
+    const completed = activity.status === 'completed'
+
+    return (
+      <ProcessGroup
+        key={activity.id}
+        active={activity.status === 'in_progress'}
+        animateWhileActive
+        activeLabel="Compacting history..."
+        ariaLabel="History compaction"
+        completedLabel={completed ? `Compacted history${duration ? ` in ${duration}` : ''}`
+          : `History compaction failed${duration ? ` after ${duration}` : ''}`}
+        indicator={<Icon name="file-reduce-line" />}
+        startedAt={activity.startedAt}
+      />
+    )
+  }
+
+  if (activity.type === 'working') {
+    return (
+      <WorkingMessage
+        key={activity.id}
+        phaseId={activity.id}
+        {...(activity.label === undefined ? {} : { label: activity.label })}
+        startedAt={activity.startedAt}
+      />
+    )
+  }
+
+  if (activity.type === 'processing') {
+    const currentRequest = activity.requests?.findLast((request) => request.isActive)
+    if (currentRequest) {
+      return (
+        <WorkingMessage
+          key={activity.id}
+          phaseId={activity.id}
+          label={currentRequest.activeLabel ?? 'Processing...'}
+          {...(currentRequest.isRuntime ? { ariaLabel: 'Leon’s tool preparation' } : {})}
+          {...(currentRequest.isGeneric ? {} : { iconName: currentRequest.iconName })}
+          startedAt={currentRequest.startedAt}
+        />
+      )
+    }
+
+    const request = activity.inline ? activity.requests?.[0] : undefined
+    if (request) {
+      return (
+        <ProcessGroup
+          key={activity.id}
+          active={false}
+          activeLabel="Processing..."
+          ariaLabel={request.isRuntime ? 'Leon’s tool preparation' : 'Leon’s inference'}
+          completedLabel={`${request.label} ${formatToolDuration(request.durationMs, DurationFormat.Precise)}`}
+          indicator={<Icon name={`${request.iconName}`} />}
+          startedAt={request.startedAt}
+        />
+      )
+    }
+
+    return (
+      <ProcessGroup
+        key={activity.id}
+        active={false}
+        activeLabel="Processing..."
+        ariaLabel="Leon’s processing"
+        className="activity-timeline-parent"
+        completedLabel={`Processed for ${formatToolDuration(activity.durationMs, DurationFormat.Compact)}`}
+        indicator={<Icon name="cpu-line" />}
+      >
+        {activity.requests?.length ? (
+          <div className="leon-message-activities activity-timeline">
+            {activity.requests.map((request) => (
+              <ProcessGroup
+                key={request.id}
+                active={false}
+                activeLabel="Processing..."
+                ariaLabel={request.isRuntime ? 'Leon’s tool preparation' : 'Leon’s inference'}
+                completedLabel={`${request.label} ${formatToolDuration(request.durationMs, DurationFormat.Precise)}`}
+                indicator={<Icon name={`${request.iconName}`} />}
+                startedAt={request.startedAt}
+              />
+            ))}
+          </div>
+        ) : undefined}
+      </ProcessGroup>
+    )
+  }
+  if (activity.type === 'other') {
+    return (
+      <ProcessGroup
+        key={activity.id}
+        active={false}
+        activeLabel="Processing..."
+        ariaLabel="Leon’s other processing"
+        completedLabel={`Other processing for ${formatToolDuration(activity.durationMs, DurationFormat.Compact)}`}
+        indicator={<Icon name="more-line" />}
+      />
+    )
+  }
+
+  if (activity.type === 'retry') {
+    return (
+      <ProcessGroup
+        key={activity.id}
+        active={false}
+        activeLabel="Retrying..."
+        ariaLabel="Leon’s retries"
+        startedAt={activity.startedAt}
+        completedLabel={`Retried ${activity.count} ${activity.count === 1 ? 'time' : 'times'}`}
+        indicator={<Icon name="refresh-line" />}
+      />
+    )
+  }
+
+  if (activity.type === 'review' || activity.type === 'answer') {
+    const isReview = activity.type === 'review'
+    const duration = formatToolDuration(activity.durationMs, DurationFormat.Compact)
+
+    return (
+      <ProcessGroup
+        key={activity.id}
+        active={false}
+        activeLabel={isReview ? 'Reviewing...' : 'Generating answer...'}
+        ariaLabel={isReview ? 'Leon’s review' : 'Leon’s answer generation'}
+        startedAt={activity.startedAt}
+        completedLabel={isReview ? `Reviewed for ${duration}` : `Generated answer in ${duration}`}
+        indicator={<Icon name={isReview ? 'search-eye-line' : 'pencil-ai-line'} />}
+      />
+    )
+  }
+
+  if (activity.type === 'thinking') {
+    return (
+      <ThinkingMessage
+        key={activity.id}
+        animationId={activity.id}
+        details={activity.details}
+        durationMs={activity.durationMs}
+        isActive={activity.isActive}
+        startedAt={activity.startedAt}
+      />
+    )
+  }
+
+  if (activity.type === 'summary') {
+    if (activity.iconName) {
+      const duration = formatToolDuration(activity.memory?.durationMs)
+      const label = `${activity.content}${duration ? ` in ${duration}` : ''}`
+      return (
+        <ProcessGroup
+          key={activity.id}
+          active={false}
+          activeLabel={label}
+          completedLabel={label}
+          ariaLabel="Leon’s activity"
+          startedAt={activity.startedAt}
+          indicator={<Icon name={`${activity.iconName}`} />}
+        >
+          {activity.memory || activity.skill ? (
+            <>
+              {activity.memory && <MemoryDetails memory={activity.memory} title={activity.content} />}
+              {activity.skill && <SkillDetails skill={activity.skill} />}
+            </>
+          ) : undefined}
+        </ProcessGroup>
+      )
+    }
+    return (
+      <div key={activity.id} className="leon-message-summary">
+        <MarkdownContent
+          animationId={activity.id}
+          startDelay={420}
+          text={activity.content}
+          active
+        />
+        {' '}
+        <ActivityTimestamp timestamp={activity.startedAt} />
+      </div>
+    )
+  }
+
+  return <ExecutionActivity key={activity.id} activity={activity} />
+}
+
+export const LeonMessage = memo(function LeonMessage({ entry }: LeonMessageProps) {
+  if (entry.connection) {
+    return <Suspense fallback={<Loader size="sm" label="Getting connection setup ready…" />}>
+      <ConnectionSetupCard connection={entry.connection} />
+    </Suspense>
+  }
+  const bonusResponse = entry.bonusResponse
+  const activities = entry.activities.map(renderActivity)
+  const preparations = getPreparations(entry.activities)
+  const duration = formatToolDuration(entry.durationMs, DurationFormat.Compact)
+
+  return (
+    <div className="leon-message">
+      {entry.status === FeedTurnStatus.Completed && !entry.isMaintenance && !entry.continues && (activities.length > 0 || entry.hasTurnWork) ? (
+        <ProcessGroup
+          active={false}
+          activeLabel="Working..."
+          ariaLabel="Leon’s completed work"
+          className="leon-message-work"
+          completedLabel={`Worked for ${duration}`}
+        >
+          {activities.length > 0 ? <div className="leon-message-activities">{activities}</div> : undefined}
+        </ProcessGroup>
+      ) : activities}
+      {(preparations.length > 0 || entry.finalAnswer.trim().length > 0 || entry.answerParts?.length || entry.artifacts?.length || entry.connections?.length) ? (
+        <FinalAnswer animationId={`${entry.id}:${entry.answerGenerationId ?? 'accepted'}:final-answer`}
+          active={entry.status !== FeedTurnStatus.Completed}
+          parts={entry.answerParts}
+          artifacts={entry.artifacts}
+          connections={entry.connections}
+          preparations={preparations}
+          timestamp={entry.sentAt} metrics={entry.metrics}
+          footer={bonusResponse !== undefined && bonusResponse.trim().length > 0 ? (
+            <BonusResponse animationId={`${entry.id}:bonus-response`}>
+              {bonusResponse}
+            </BonusResponse>
+          ) : undefined}>
+          {entry.finalAnswer}
+        </FinalAnswer>
+      ) : null}
+    </div>
+  )
+})

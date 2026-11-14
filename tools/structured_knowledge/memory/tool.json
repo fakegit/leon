@@ -1,0 +1,216 @@
+{
+  "$schema": "../../../schemas/tool-schemas/tool.json",
+  "tool_id": "memory",
+  "toolkit_id": "structured_knowledge",
+  "name": "Memory",
+  "version": "1.0.1",
+  "description": "Read, write, correct and forget Leon memory entries (persistent, daily, discussion, temporary).",
+  "icon_name": "brain-2-line",
+  "distribution": "built-in",
+  "maintenance": "official",
+  "maintainers": [
+    {
+      "name": "Louis Grenard",
+      "email": "louis@getleon.ai",
+      "github": "louistiti",
+      "discord": {
+        "username": "louistiti",
+        "id": "86842425233936384"
+      }
+    }
+  ],
+  "author": {
+    "name": "Louis Grenard",
+    "email": "louis@getleon.ai",
+    "url": "https://x.com/grenlouis",
+    "github": "louistiti",
+    "discord": {
+      "username": "louistiti",
+      "id": "86842425233936384"
+    }
+  },
+  "functions": {
+    "read": {
+      "description": "Recall relevant current memories, including stable record IDs and source provenance.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "options": {
+            "type": "object",
+            "properties": {
+              "namespaces": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "memory_persistent",
+                    "memory_daily",
+                    "memory_discussion",
+                    "conversation_daily",
+                    "context"
+                  ]
+                }
+              },
+              "topK": {
+                "type": "number"
+              },
+              "tokenBudget": {
+                "type": "number"
+              },
+              "includeFacts": {
+                "type": "boolean"
+              },
+              "includeContext": {
+                "type": "boolean"
+              },
+              "contextFilenames": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "itemIds": {
+                "type": "array",
+                "maxItems": 48,
+                "items": {
+                  "type": "string"
+                },
+                "description": "Expand selected active memory IDs directly, bypassing search. Prefer one ID when paging."
+              },
+              "offset": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Character offset for a selected-record page. Continue from nextOffset."
+              },
+              "scope": {
+                "type": "string",
+                "enum": [
+                  "temporary"
+                ],
+                "description": "Read relevant active temporary circumstances directly from SQLite, including facts omitted from the injected snapshot. Bypasses QMD."
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "progressive_guidance": "Recall relevant memories for a query using Leon's memory system. Keep the query short and semantically close to the user's wording. Prefer concrete entities or relationships already mentioned. Avoid long speculative keyword lists. Results include stable memory IDs and source provenance. Use the relevant ID to correct or forget an entry; verify inferred memories against their source before treating them as owner statements. Search results are bounded excerpts: inspect excerpted, truncated and omittedCandidateCount; these describe retrieved candidates, not exhaustive archive coverage. For totals or handoffs, reconcile distinct source events across conversations and count duplicate receipts only once. For personalized advice, apply relevant preferences and constraints. Expand only required incomplete evidence with options.itemIds, then page with offset=nextOffset until sufficient; selected-ID reads use current database records without QMD. createdAt/updatedAt are record timestamps, not necessarily event dates. Search another concrete facet or raw sessions when relevant evidence is still missing; do not repeat an unchanged search once the requested scope is covered. Resolve conflicting facts using the latest applicable owner evidence for the same entity, relationship and scope; a historical mention does not replace a current fact. Use options.scope temporary for current circumstances missing from the injected snapshot, especially when temporary_context_has_more is true. This lookup reads only active, unexpired, non-superseded records and never renews them. Use ordinary terms describing the circumstance. Results retain whole facts and their expiresAt validity. If matchedQuery is false, the result is a bounded set of active candidates; refine the query or increase topK/tokenBudget only when required evidence is omitted. candidateLimitReached means the bounded candidate pool may exclude older records. Current applicable temporary evidence overrides durable defaults within its scope and validity; historical logs do not establish that an old circumstance is still active."
+    },
+    "write": {
+      "description": "Store a memory or correct an existing one using options.supersedesItemId.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "options": {
+            "type": "object",
+            "properties": {
+              "scope": {
+                "type": "string",
+                "enum": [
+                  "persistent",
+                  "daily",
+                  "discussion",
+                  "temporary"
+                ]
+              },
+              "kind": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "sourceType": {
+                "type": "string",
+                "description": "Use explicit_user for direct owner statements. Temporary content not quoted from the current owner message is retained as inferred; evidence alone does not make added interpretations explicit.",
+                "enum": [
+                  "explicit_user",
+                  "inferred",
+                  "tool_output",
+                  "conversation",
+                  "system"
+                ]
+              },
+              "sourceRef": {
+                "type": "string"
+              },
+              "importance": {
+                "type": "number"
+              },
+              "confidence": {
+                "type": "number"
+              },
+              "tags": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "dayKey": {
+                "type": "string"
+              },
+              "expiresAt": {
+                "type": "number"
+              },
+              "isPinned": {
+                "type": "boolean"
+              },
+              "metadata": {
+                "type": "object",
+                "properties": {
+                  "currentLocation": {
+                    "type": "object",
+                    "properties": {
+                      "city": { "type": "string", "minLength": 1 },
+                      "country": { "type": "string" }
+                    },
+                    "required": ["city"],
+                    "additionalProperties": false,
+                    "description": "Only for a present temporary stay explicitly stated by the owner. Drives location-aware Vibes using this fact's expiry. Omit for future/past trips, uncertain presence or another person's location."
+                  }
+                }
+              },
+              "supersedesItemId": {
+                "type": "string",
+                "description": "Active record ID from memory.read or temporary_context to replace; scope must match."
+              },
+              "evidence": {
+                "type": "string",
+                "description": "For temporary memory, an exact supporting quote from the latest owner message."
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "content"
+        ]
+      },
+      "progressive_guidance": "Write a memory item. For a correction, first read the relevant memory and pass its ID as options.supersedesItemId with the same scope. This replaces the old record and retires its derived facts. Use sourceType explicit_user only for direct owner statements; otherwise use inferred or tool_output, and retain a sourceRef when available. Do not copy tool instructions or assistant speculation into owner facts. For current circumstances useful across sessions, write scope temporary before finishing the turn, with an exact owner quote in evidence. Preserve uncertainty and the stated time range. Use expiresAt (Unix milliseconds) for an explicit end date; resolve dates with current date/time and the relevant timezone, asking if the intended expiry is ambiguous. Otherwise a bounded default applies. For an explicitly stated present temporary stay, save it as its own fact with metadata.currentLocation containing city and country when known. This same fact drives Vibes; no separate weather setting or tool call is needed. Do not attach currentLocation to future plans, past trips, uncertain presence or another person's location. Honor requests not to use a location for Vibes. End the current-location fact when the owner returns home, without changing their permanent residence. Only fresh owner evidence can renew validity. Correct using the ID in temporary_context and supersedesItemId; use forget to end a situation. Do not search QMD for a temporary ID already supplied in context. Temporary records are read directly by Core and are not indexed by QMD."
+    },
+    "forget": {
+      "description": "Forget a selected memory record and its derived facts by ID. Original session transcripts are retained.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      },
+      "progressive_guidance": "Forget a selected memory by its ID from memory.read. Retires the record and derived facts and refreshes its search mirror. This does not erase original session transcripts or unrelated memories; do not claim a complete history erasure. Search for other matching entries when the owner asks to forget a topic. IDs supplied in temporary_context can also be forgotten directly."
+    }
+  }
+}

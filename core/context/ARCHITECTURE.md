@@ -1,0 +1,89 @@
+> Routing and tool execution, client and profile runtimes, Satellite and computer use, agent loop, context, memory, and reliability. Leon-native skills are layered as Skills -> Actions -> Tools -> Functions (-> Binaries).
+# ARCHITECTURE
+- Generated at: 2026-11-10T23:05:31+08:00
+- Leon-native layer model: `Skills -> Actions -> Tools -> Functions (-> Binaries)`.
+- Routing model: agent mode is the default and runs the continuous agent loop, optionally following selected agent skills; smart mode auto-selects the best path; controlled mode runs deterministic Leon-native skills/actions.
+- Core runtime: `core/brain/brain.ts`, `llm-duties/react-llm-duty.ts`, `tool-manager/toolkit-registry.ts`, `tool-manager/tool-executor.ts`.
+## Core Principles
+- Explicit tools over implicit behavior: Leon calls declared tools/functions instead of free-form shell logic whenever possible.
+- Progressive grounding: Leon prefers context and memory tools first, then shell only when no dedicated tool can satisfy the request.
+- Auditable steps: Leon keeps plan/execution traces, token usage logs, and tool observations so decisions remain inspectable.
+- Tools own dependencies, settings, connections and device behavior. Core/bridge hosts own execution, transport and authentication. `bridges/runtime/` holds dependency-free shared contracts/Node.js capabilities; Core and SDK implementations stay independent with equivalent Node.js/Python SDK behavior.
+- Native tools keep their SDK workers. Owner-installed HTTP MCP servers have profile-local tool manifests and bounded discovered schemas; Core owns their lazy transports, encrypted OAuth and cancellation, routing results through the ordinary execution/logging lifecycle. Bundled MCP catalog entries alone are not installed or callable, and remote writes are never automatically replayed.
+- Tool catalogs derive from canonical tools/<toolkit>/<tool>/tool.json definitions for native and MCP sources. Native skills use skill.json; Agent Skills retain SKILL.md discovery with optional format-specific skill.json package metadata. Built-in distribution, optional extension installation, profile availability and maintenance provenance are independent; owner-facing documentation and local assets load only on demand and never enter model prompts. Previous tool IDs retain installed identity and authorization without rewriting history.
+- The agent searches bounded local catalog metadata on demand before declaring a service unavailable. Catalog discovery is read-only; trusted setup cards require explicit owner actions to add, enable and authorize tools while respecting profile policy.
+## Client Interfaces
+- Leon exposes a client-agnostic Socket.IO interface so built-in and custom clients can connect through the same live dialogue contract.
+- Browser conversations use profile-scoped HTTP commands and durable SSE replay; Socket.IO remains available for other clients. Browser and legacy owner-agent entry points share turn orchestration.
+- Aurora visual answers combine bounded native widgets and versioned generated HTML/CSS/JavaScript surfaces in durable answer parts. Generated code runs only in opaque-origin browser frames with restricted resources and an ancestor navigation policy; locally bundled Aurora/chart runtimes load on demand. Only declared values confirmed outside the frame can become profile/session-bound owner commands. Receipts commit atomically, replay never submits actions, and required questions reuse the clarification lifecycle.
+- External HTTP plugins can extend Leon's HTTP contract without patching the core API for each integration.
+- Custom clients can read profile-owned extension JSON files through a generic redacted HTTP endpoint, covering skill memory, skill settings, and tool settings without exposing secrets.
+- The LLM layer supports media understanding and generation; generated files are conversation artifacts with authenticated downloads and inline media playback.
+- Setup discovers known AI fellows and can reuse their API keys or bind with some AI provider accounts. AI and tool connections share profile encryption with separate stores and setup handlers; /connection lists both, and /connection ai manages AI connections.
+## Profile Runtimes
+- One Leon server can serve multiple profiles concurrently, with each request and agent turn bound to one profile for its full asynchronous lifetime.
+- Runtime services are created lazily per profile, while config, secrets, encrypted connections, sessions, memory, context, skills, tools, settings, and logs remain isolated in profile-owned paths.
+- A `<profile>:<token>` credential selects and authenticates the profile across Socket.IO clients, HTTP integrations, and Leon Satellite.
+## Leon Satellite
+- Leon Satellite is an optional process on a user device that connects its enabled and available profile tools to a remote Leon server.
+- Eligible tool calls are routed through Satellite and executed on that device; those tools become unavailable when Satellite disconnects.
+- Satellite provides generic transport only. Device-, application-, and company-specific behavior stays in tools and skills instead of Leon Core.
+## Browser & Computer Use
+- The browser_use toolkit uses Browser Use CLI for direct browser inspection and actions in the configured browser session. Cua handles graphical application control locally or through Leon Satellite, retaining its session and cleaning up native resources through the worker host.
+- Computer use respects owner app preferences and permissions, adapts to platform capabilities, and uses observed results to verify actions and recover from ineffective attempts.
+## Agent Loop
+- Owner-agent turns enter `core/turn-lifecycle/`: pre-turn preparation, the existing agent loop, foreground persistence/delivery, then shared asynchronous post-turn maintenance. Execution-time inferences stay inside the loop; transport adapters do not independently select maintenance tasks.
+- Session title inference starts alongside the first owner-agent turn without blocking it; in-flight generation is coalesced and manual renames or deletion take precedence over late results.
+- Local AI setup uses llmfit and native allocation estimates to select a model and precision against available memory with safety headroom. Local llama.cpp prioritizes owner turns over auxiliary inference and rechecks capacity for context sizing, token admission and output fitting.
+- Profile-local `logs/turns/` journals and `logs/usage/` ledgers correlate turn/stage/task/attempt identities, timings and reported tokens, cache usage and cost. Auxiliary tasks have independent trace scopes and do not inflate foreground turn duration; audit replay never automatically repeats model calls or memory mutations. Owner-profile sync records rejected revisions separately from extraction, retaining only content-free reason codes and issue counts.
+- One provider transcript preserves requests, matching tool exchanges, recovery and answers across conversation turns; edited chat invalidates reuse.
+- Tool schemas load progressively from the toolkit catalog as the task needs them. Guidance follows toolkit -> tool -> function, with function-specific instructions loaded alongside selected schemas before use.
+- Stable rules precede append-only owner, clock, mood, plan, guidance and budget updates; full context files and Agent Skills load on demand.
+- The model-facing transcript has a fixed input budget: large tool results stay in artifact logs with bounded previews, and inactive toolkit schemas plus older completed tool exchanges are compacted progressively only when needed.
+- Checkpoints and summaries preserve task state as transcripts grow or work resumes.
+- Tool state is separated: installed tools exist in the registry, enabled tools are not disabled by the owner, and available tools have the required settings to run.
+- Deterministic runtime guards validate and repair arguments, block duplicate calls, execute tools, and return every success or failure as a structured observation to the same loop.
+- The model batches independent calls within or across planned work. Tools run concurrently in isolated workers by default; tool-level serial declarations preserve shared sessions and instance state, and function-level overrides allow both in one tool. Bookkeeping stays ordered, and results retain their emitted transcript order.
+- Coding runs directly in the existing agent loop, guided by an Agent Skill and repository instructions. The file tool supports targeted patches; the shell tool supports finite commands and retained conversation-owned command sessions. External coding agents are optional owner-selected delegates.
+- Core retains opted-in background and oversized synchronous agent results per profile/conversation, with handles, cancellation, progress, bounded waits and structured queries without reexecution.
+- SDK binary/resource preparation is retained independently of tool background settings. Follow-up messages leave downloads running but require reassessment before the dependent action; explicit cancellation and deadlines still stop preparation. Worker and Satellite boundaries preserve this separation.
+- Workers load assets from the codebase and resolve relative task files in the caller's workspace; Satellite uses its device's workspace.
+- Plans track scope, collection coverage and verified outcomes; their worklists persist through checkpointing and continuation.
+- The agent can share progress updates alongside tool calls during longer tasks.
+- Foreground inference lifecycle metadata streams to browser clients and survives replay; private review content and auxiliary background inferences stay out of live feed activity.
+- MCP connection waits and schema discovery emit measured runtime activities only when performed. Shared ready transports do not repeat connection labels; intervals are distinct from model/token usage and excluded from unmeasured turn time without double-counting overlap.
+- Memory and experience outcomes persist in the originating reply’s activity timeline; background results leave completed turns completed.
+- FYI footers run independently after final-answer delivery with separate usage accounting. Profile-local conversation storage persists each footer and atomically rotates mindset lines; durable events update the originating answer without reopening the turn or adding footer text to model context.
+- Clarification pauses preserve the transcript, plan and execution state so the owner reply can resume the same task.
+- Profiles can limit agent iterations or run time; callers can supply a fixed deadline. Model calls, retries, tools and review share the deadline and reserve time for required writes, checks and the answer. Exhaustion preserves progress and reports incomplete work without renewed approval.
+- Completion review checks task evidence and plan progress; only opted-in, complete single lookups with default options can skip it. Plans, failures, recovery, partial/retained results and resumed unfinished work retain review.
+- Model failures use bounded recovery before reporting an unresolved blocker.
+- Leon has a living personality and a changing mood that influence its tone and behavior.
+- A bounded private self-model/diary is updated after turns, promotes repeated habits into stable behavioral principles, and injects only a compact snapshot into the first agent request.
+- A periodic pulse manager can generate autonomous agent matters from memory, context deltas, and the private self-model, persist them to `PULSE.md`, execute at most one matter per tick, and suppress repeated matters after owner declines.
+- Pulse work uses the owning conversation's ordinary agent turn, transcript, tool execution and answer lifecycle. Owner messages interrupt stale work to redirect or cancel the task; cancellation ends execution without completion review or automatic continuation.
+## Context Intelligence
+- Leon maintains runtime context files (system, activity, browser, network, workspace, habits, inventory, media, architecture, identity).
+- Leon uses `structured_knowledge.context.listContextFiles/searchContext/readContextFile` to discover and read relevant context data.
+- Leon searches prior conversations and pages selected source messages on demand through the sessions tool, preserving source references and bounded context.
+- Context-first policy: for runtime/environment questions (VPN, system state, apps, browsing), Leon inspects context before memory/shell.
+- Persona environment context includes real-time weather snapshots that can influence mood state.
+## Memory System
+- Temporary context uses profile-local SQLite and a bounded prompt snapshot with an overflow flag; omitted active facts can be retrieved on demand without QMD.
+- Memory is layered into persistent, daily, and discussion stores, with context files available as a separate grounding source.
+- `OWNER.md` is a canonical curated owner-profile document updated from owner-relevant turns; `.owner-profile.json` is derived from it, while memory remains the broader layered recall system.
+- Conversation turns feed daily and discussion memory; background extraction reconciles durable corrections against a bounded set of relevant active records, rejecting stale replacements.
+- Pending memory extraction batches up to three turns per conversation; explicit memory writes finish before the reply.
+- Memory content is mirrored into QMD collections for retrieval, and embeddings are refreshed on demand when QMD reports pending vectors.
+- Recall uses QMD with adaptive rescue, bounded distinct-record excerpts and coverage signals; selected active records can be paged directly without another search.
+- Read priority stays grounded: context for environment/runtime facts, memory for personal history/preferences, raw session search for exact prior evidence, and shell as a last resort.
+- Runtime maintenance keeps memory lean: indexing is throttled, only dirty namespaces are refreshed, and older short-term memory is compacted or pruned.
+## Learning & Experience
+- Leon learns through memory for facts, the self-model for service habits, and experiences for reusable procedures.
+- Post-turn maintenance learns verified procedures and stores them under each profile's skills/agent/experiences as SKILL.md files with a SQLite index, separate from built-in and owner-installed skills.
+- A small shortlist matches the current task; full procedures load on demand. Retrieval uses local matching, without QMD or an extra LLM call.
+- The limit is 196 experiences. Retention uses last use, or creation time when unused, and protects active procedures. Loading and use have separate counters.
+## Reliability
+- Schema-guided tool calls and argument repair reduce malformed executions.
+- Duplicate-input guards and observation-driven recovery reduce repeated bad calls while preserving successful progress.
+- Leon prefers dedicated tools over shell commands to keep behavior stable and auditable.

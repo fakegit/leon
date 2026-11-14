@@ -1,0 +1,558 @@
+import fs from 'node:fs/promises'
+import syncFs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { randomUUID } from 'node:crypto'
+
+import Fastify from 'fastify'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import { ConversationLogger } from '@/conversation-logger'
+import { POST_TURN_MAINTENANCE_QUEUE } from '@/core'
+import { sessionsPlugin } from '@/core/http-server/api/sessions'
+import { CONVERSATION_SESSION_MANAGER } from '@/core/session-manager'
+import { CONVERSATION_REPOSITORY } from '@/core/session-manager/conversation-repository'
+import { WEB_SESSION_RUNTIME } from '@/core/session-manager/web-session-runtime'
+import { enterProfileContext, getActiveProfileName, runWithProfileContext } from '@/core/profile-runtime/profile-context'
+import type { ReactLLMDutyParams } from '@/core/llm-manager/llm-duties/react-llm-duty/agent-types'
+import { CONFIG_STATE } from '@/core/config-states/config-state'
+import type { ProfilePaths } from '@/core/profile-runtime/profile-paths'
+import { applyConversationEvent } from '../../../apps/web/src/data/conversation-events'
+import { toFeedEntry } from '../../../apps/web/src/data/conversation-feed'
+import type { ConversationRecord, ConversationEvent } from '../../../apps/web/src/data/conversation'
+import { FyiKind } from '@/core/fyi/fyi-contract'
+import { auroraParts, AURORA_CHOICE_SPEC, AURORA_GENERATED_SPEC } from '../../fixtures/aurora'
+import { PreparationStatus } from '../../../aurora/src/v2/contracts/preparation'
+import { ContextStateStore } from '@/core/context-manager/context-state-store'
+import { AgentSessionState } from '@/core/llm-manager/llm-duties/react-llm-duty/agent-session-state'
+import { createAgentLoopContinuationState, type AgentLoopContinuationState } from '@/core/llm-manager/llm-duties/react-llm-duty/agent-loop-continuation'
+import { runWithConversationSession } from '@/core/session-manager/session-context'
+
+const fixture = vi.hoisted(() => ({
+  root: '',
+  logger: null as ConversationLogger | null,
+  executions: [] as { profile: string, session: string, query: string, target: string, release: () => void }[]
+}))
+
+vi.mock('@/core', () => ({
+  TOOLKIT_REGISTRY: { getToolIconLogo: (): undefined => undefined },
+  LLM_PROVIDER: { runForegroundTurn: <T>(execute: () => Promise<T>): Promise<T> => execute() },
+  CONVERSATION_LOGGER: {
+    upsert: (...args: Parameters<ConversationLogger['upsert']>): Promise<void> => fixture.logger!.upsert(...args)
+  },
+  POST_TURN_MAINTENANCE_QUEUE: { enqueue: vi.fn(), enqueueBatch: vi.fn(), startConcurrent: vi.fn() }
+}))
+vi.mock('@/core/fyi', () => ({
+  generateFyi: vi.fn(async () => ({ kind: FyiKind.Fact, text: 'FYI, a related fact can add a little context.' }))
+}))
+vi.mock('@/core/profile-runtime/initialize-profile-runtime', () => ({
+  ensureActiveProfileRuntime: vi.fn(async () => undefined)
+}))
+vi.mock('@/core/profile-runtime/profile-paths', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/core/profile-runtime/profile-paths')>()
+  const { getActiveProfileName: readProfile } = await import('@/core/profile-runtime/profile-context')
+  const paths = await import('node:path')
+
+  return {
+    ...actual,
+    getProfilePaths: (): ProfilePaths => {
+      if (!fixture.root) {
+        return actual.getProfilePaths()
+      }
+      const profile = readProfile()
+      const root = paths.join(fixture.root, profile)
+
+      return {
+        ...actual.getProfilePaths(profile), root,
+        sessions: paths.join(root, 'sessions'), context: paths.join(root, 'context')
+      }
+    }
+  }
+})
+vi.mock('@/core/llm-manager/llm-duties/react-llm-duty', () => ({
+  ReActLLMDuty: class {
+    public constructor(private readonly params: ReactLLMDutyParams) {}
+
+    public async init(): Promise<void> {}
+
+    public async execute(): Promise<unknown> {
+      const session = CONVERSATION_SESSION_MANAGER.getCurrentSessionId()
+      const turn = CONVERSATION_SESSION_MANAGER.openAgentTurn(session)
+      const query = String(this.params.input)
+      const trace = {
+        id: this.params.responseId!, planSteps: [], toolCalls: [],
+        reasoning: [{ id: `${query}:thought`, text: 'Public reasoning', phase: 'agent', startedAt: Date.now() }]
+      }
+      await fixture.logger!.upsert({
+        who: 'leon', messageId: trace.id, message: '', isAddedToHistory: false, agentResponseTrace: trace
+      }, { sessionId: session, activity: true })
+      this.params.onTextStream?.('reasoning', { token: 'Public reasoning', generationId: `${query}:thought` })
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const signal = this.params.signal!
+          const abort = (): void => reject(signal.reason)
+          signal.addEventListener('abort', abort, { once: true })
+          fixture.executions.push({ profile: getActiveProfileName(), session, query,
+            target: CONFIG_STATE.getModelState().getAgentTarget().label, release: () => {
+            signal.removeEventListener('abort', abort)
+            resolve()
+          } })
+          if (signal.aborted) {
+            abort()
+          }
+        })
+        this.params.onTextStream?.('answer', { token: `Done: ${query}`, generationId: query })
+
+        return { output: `Done: ${query}`, data: {
+          agentResponseTrace: trace, llmMetrics: { durationMs: 250 }, finalIntent: 'answer'
+        } }
+      } finally {
+        turn.close()
+      }
+    }
+  }
+}))
+
+describe('web conversation runtime', () => {
+  let profile = ''
+  let app = Fastify()
+
+  const request = (method: 'GET' | 'POST' | 'PATCH' | 'DELETE', url: string, payload?: unknown): ReturnType<typeof app.inject> =>
+    app.inject({ method, url, headers: { 'x-test-profile': profile }, ...(payload ? { payload } : {}) })
+
+  beforeEach(async () => {
+    fixture.root = await fs.mkdtemp(path.join(os.tmpdir(), 'leon-web-sessions-'))
+    profile = randomUUID()
+    fixture.executions.length = 0
+    fixture.logger = new ConversationLogger({
+      loggerName: 'Conversation integration', fileName: 'conversation_log.json',
+      nbOfLogsToLoad: 256, nbOfLogsToKeep: 1_024
+    })
+    app = Fastify()
+    app.addHook('onRequest', async (incoming) => {
+      enterProfileContext({ profileName: String(incoming.headers['x-test-profile']) })
+    })
+    await app.register(sessionsPlugin, { apiVersion: 'v1' })
+    await app.ready()
+  })
+
+  afterEach(async () => {
+    for (const execution of fixture.executions) {
+      execution.release()
+    }
+    await runWithProfileContext({ profileName: profile }, async () => {
+      for (const session of CONVERSATION_SESSION_MANAGER.listSessions()) {
+        await WEB_SESSION_RUNTIME.stop(session.id)
+      }
+      CONVERSATION_REPOSITORY.close()
+    })
+    await app.close()
+    await fs.rm(fixture.root, { recursive: true, force: true })
+  })
+
+  async function create(): Promise<string> {
+    const id = randomUUID()
+    const response = await request('POST', '/api/v1/sessions?compact=true', { id })
+    expect(response.statusCode).toBe(200)
+    expect(response.json()).not.toHaveProperty('sessions')
+
+    return id
+  }
+
+  it.each([
+    { kind: 'native', spec: AURORA_CHOICE_SPEC, nodeId: 'choice', values: ['creative'], text: 'Something creative' },
+    { kind: 'generated', spec: AURORA_GENERATED_SPEC, nodeId: 'reading', values: { minutes: '45' }, text: 'Daily reading goal (minutes): 45' }
+  ])('dispatches accepted $kind UI submissions through the ordinary session runtime and deduplicates retries', async (example) => {
+    const sessionId = await create()
+    await runWithProfileContext({ profileName: profile }, async () => {
+      CONVERSATION_REPOSITORY.upsertMessage(sessionId, { who: 'owner', messageId: 'owner', message: 'Help me choose.', isAddedToHistory: true })
+      CONVERSATION_REPOSITORY.upsertMessage(sessionId, { who: 'leon', messageId: 'question', message: 'How would you like to start?',
+        answerParts: auroraParts('owner', example.spec), isAddedToHistory: true })
+    })
+    const body = { id: randomUUID(), surfaceId: 'surface-one', nodeId: example.nodeId, revision: 1, values: example.values }
+    const endpoint = `/api/v1/sessions/${sessionId}/messages/question/ui`
+    const first = await request('POST', endpoint, body)
+    expect(first.statusCode).toBe(202)
+    expect(first.json().command.query).toContain(example.text)
+    await expect.poll(() => fixture.executions.length).toBe(1)
+    const second = await request('POST', endpoint, body)
+    expect(second.statusCode).toBe(202)
+    expect(second.json().command.id).toBe(body.id)
+    expect(fixture.executions).toHaveLength(1)
+    expect((await request('POST', endpoint, { ...body, id: randomUUID() })).statusCode).toBe(409)
+    const page = await request('GET', `/api/v1/sessions/${sessionId}?limit=40`)
+    const question = page.json().messages.find((record: { messageId: string }) => record.messageId === 'question')
+    expect(question.answerParts[0].surface.receipts[example.nodeId].commandId).toBe(body.id)
+    expect(page.json().messages.filter((record: { messageId: string }) => record.messageId === body.id)).toHaveLength(1)
+    fixture.executions[0]!.release()
+    await expect.poll(() => runWithProfileContext({ profileName: profile }, () => WEB_SESSION_RUNTIME.isRunning(sessionId))).toBe(false)
+    expect((await request('POST', endpoint, body)).statusCode).toBe(202)
+    expect(fixture.executions).toHaveLength(1)
+  })
+
+  it('does not present an unavailable retained preparation as live after recovery', async () => {
+    const sessionId = await create()
+    await runWithProfileContext({ profileName: profile }, () => {
+      CONVERSATION_REPOSITORY.upsertMessage(sessionId, { who: 'leon', messageId: 'answer', message: 'Saved answer.', isAddedToHistory: true,
+        agentResponseTrace: { id: 'answer', planSteps: [], toolCalls: [{ id: 'download', name: 'speech.asr.transcribe', status: 'running',
+          preparation: { status: PreparationStatus.Downloading, executionId: 'missing-retained-work', detail: 'Downloading.', completed: 40, total: 100 } }] } })
+    })
+    const page = await request('GET', `/api/v1/sessions/${sessionId}?limit=40`)
+    const preparation = page.json().messages[0].agentResponseTrace.toolCalls[0].preparation
+    expect(preparation.status).toBe('failed')
+    expect(preparation.detail).toContain('no longer active')
+    const details = await request('GET', `/api/v1/sessions/${sessionId}/messages/answer`)
+    expect(details.json().message.agentResponseTrace.toolCalls[0].preparation).toEqual(preparation)
+    await runWithProfileContext({ profileName: profile }, () => {
+      expect(CONVERSATION_REPOSITORY.readMessage(sessionId, 'answer')!.agentResponseTrace!.toolCalls[0]!.preparation!.status).toBe('downloading')
+    })
+    expect(fixture.executions).toHaveLength(0)
+  })
+
+  it('keeps interrupted visual answers inactive and preserves their explanation in saved history', async () => {
+    const sessionId = await create()
+    const id = randomUUID()
+    expect((await request('POST', `/api/v1/sessions/${sessionId}/messages`, { id, query: 'Help me choose.' })).statusCode).toBe(202)
+    await expect.poll(() => fixture.executions.length).toBe(1)
+    await runWithProfileContext({ profileName: profile }, async () => {
+      const parts = auroraParts(id)
+      const part = parts[0]!
+      if (part.kind === 'ui') {
+        part.surface.status = 'draft'
+      }
+      CONVERSATION_REPOSITORY.updateAnswerParts(sessionId, `${id}:leon`, () => parts)
+      await WEB_SESSION_RUNTIME.stop(sessionId)
+    })
+    const page = await request('GET', `/api/v1/sessions/${sessionId}?limit=40`)
+    const answer = page.json().messages.find((record: { messageId: string }) => record.messageId === `${id}:leon`)
+    expect(answer.message).toBe('Stopped by you.')
+    expect(answer.answerParts).toEqual([
+      expect.objectContaining({ kind: 'ui', surface: expect.objectContaining({ status: 'draft' }) }),
+      { id: `${id}:leon:text`, kind: 'text', text: 'Stopped by you.' }
+    ])
+    expect((await request('POST', `/api/v1/sessions/${sessionId}/messages/${id}:leon/ui`, {
+      id: randomUUID(), surfaceId: 'surface-one', nodeId: 'choice', revision: 1, values: ['quiet']
+    })).statusCode).toBe(409)
+  })
+
+  it('pages metadata and history without starting a model, and preserves CRUD changes', async () => {
+    const first = await create()
+    const second = await create()
+    await request('PATCH', `/api/v1/sessions/${first}?compact=true`, { title: 'Camera notes', is_pinned: true })
+    const page = await request('GET', '/api/v1/sessions/page?limit=1')
+    expect(page.json().sessions[0]).toMatchObject({ id: first, title: 'Camera notes', isPinned: true })
+    expect(page.json().next_cursor).toBeTypeOf('string')
+    const search = await request('GET', '/api/v1/sessions/page?query=camera')
+    expect(search.json().sessions.map((session: { id: string }) => session.id)).toEqual([first])
+    const detail = await request('GET', `/api/v1/sessions/${second}?limit=1`)
+    expect(detail.json().messages).toEqual([])
+    expect(detail.json().event_cursor).toBeTypeOf('number')
+    await runWithProfileContext({ profileName: profile }, async () => {
+      for (const [messageId, message] of [['opening', 'Opening.'], ['ending', 'Closing.']]) {
+        CONVERSATION_REPOSITORY.upsertMessage(first, {
+          who: 'owner', messageId, message, isAddedToHistory: true
+        })
+      }
+    })
+    const source = await request('GET', `/api/v1/sessions/${first}/text?limit=8`)
+    expect(source.json().data.messages.map((message: { text: string }) => message.text)).toEqual(['Opening.'])
+    const cursor = encodeURIComponent(source.json().data.nextCursor)
+    const ending = await request('GET', `/api/v1/sessions/${first}/text?limit=8&cursor=${cursor}`)
+    expect(ending.json().data.messages.map((message: { text: string }) => message.text)).toEqual(['Closing.'])
+    expect(ending.json().data.nextCursor).toBeNull()
+    expect((await request('GET', `/api/v1/sessions/${second}/text?cursor=${cursor}`)).statusCode).toBe(400)
+    expect((await request('GET', `/api/v1/sessions/${first}/text?limit=0`)).statusCode).toBe(400)
+    expect((await request('GET', '/api/v1/sessions/missing/text')).statusCode).toBe(404)
+    expect(fixture.executions).toHaveLength(0)
+    await runWithProfileContext({ profileName: profile }, async () => {
+      CONVERSATION_REPOSITORY.upsertMessage(second, {
+        who: 'owner', messageId: 'camera-source', message: 'A quiet note about the camera.', isAddedToHistory: true
+      })
+    })
+    const matches = (await request('GET', '/api/v1/sessions/page?query=camera')).json()
+    expect(matches.sessions.map((session: { id: string }) => session.id)).toEqual([first, second])
+    expect(matches.search_matches).toEqual({ [second]: { excerpt: 'A quiet note about the camera.' } })
+    expect((await request('GET', '/api/v1/sessions/page')).json()).not.toHaveProperty('search_matches')
+    await request('DELETE', `/api/v1/sessions/${first}?compact=true`)
+    expect((await request('GET', `/api/v1/sessions/${first}`)).statusCode).toBe(404)
+  })
+
+  it('reads only the requested invocation, bounds previews, and authorizes complete bodies within the profile', async () => {
+    const id = await create()
+    const other = await create()
+    const text = 'result\n'.repeat(10_000)
+    await runWithProfileContext({ profileName: profile }, async () => {
+      CONVERSATION_REPOSITORY.upsertMessage(id, {
+        who: 'leon', messageId: 'answer', message: 'Done', isAddedToHistory: true,
+        agentResponseTrace: { id: 'trace', planSteps: [], toolCalls: [
+          { id: 'one', name: 'test.lookup', status: 'success', input: { query: 'hello' }, output: text },
+          { id: 'two', name: 'test.lookup', status: 'success', output: 'another tool result' }
+        ] }
+      })
+    })
+    const route = `/api/v1/sessions/${id}/messages/trace/tools/one`
+    const preview = await request('GET', route)
+    expect(preview.statusCode).toBe(200)
+    expect(preview.json().output.truncated).toBe(true)
+    expect(preview.body.length).toBeLessThan(20_000)
+    expect(preview.body).not.toContain('another tool result')
+    expect((await request('GET', `${route}?complete=true`)).json().output.text).toBe(text)
+    expect((await request('GET', `${route}?complete=invalid`)).statusCode).toBe(400)
+    expect((await request('GET', `/api/v1/sessions/${other}/messages/trace/tools/one`)).statusCode).toBe(404)
+    const previousProfile = profile
+    profile = randomUUID()
+    try {
+      expect((await request('GET', route)).statusCode).toBe(404)
+    } finally {
+      await runWithProfileContext({ profileName: profile }, async () => CONVERSATION_REPOSITORY.close())
+      profile = previousProfile
+    }
+  })
+
+  it('pages query text separately from answers and rejects missing sessions and invalid budgets', async () => {
+    const id = await create()
+    const other = await create()
+    await runWithProfileContext({ profileName: profile }, async () => {
+      CONVERSATION_REPOSITORY.acceptCommand(id, randomUUID(), 'First query')
+      CONVERSATION_REPOSITORY.upsertMessage(id, {
+        who: 'leon', message: 'Answer', isAddedToHistory: true
+      })
+      CONVERSATION_REPOSITORY.acceptCommand(id, randomUUID(), 'Second query\nsecond line')
+      CONVERSATION_REPOSITORY.acceptCommand(other, randomUUID(), 'Other session')
+    })
+
+    const page = await request('GET', `/api/v1/sessions/${id}/queries?limit=1`)
+    expect(page.statusCode).toBe(200)
+    expect(page.json().queries).toEqual([{
+      messageId: expect.any(String), message: 'Second query\nsecond line'
+    }])
+    const older = await request('GET', `/api/v1/sessions/${id}/queries?before=${page.json().next_cursor}`)
+    expect(older.json().queries.map((query: { message: string }) => query.message)).toEqual(['First query'])
+    expect(older.json().next_cursor).toBeNull()
+    expect((await request('GET', `/api/v1/sessions/${id}/queries?characters=1`)).json().queries).toEqual([])
+    for (const query of ['limit=101', 'before=NaN', 'characters=0', `characters=${Number.MAX_SAFE_INTEGER + 1}`]) {
+      expect((await request('GET', `/api/v1/sessions/${id}/queries?${query}`)).statusCode).toBe(400)
+    }
+    expect((await request('GET', '/api/v1/sessions/missing/queries')).statusCode).toBe(404)
+    expect(fixture.executions).toHaveLength(0)
+  })
+
+  it('runs different sessions concurrently, deduplicates delivery, and stops only the addressed session', async () => {
+    const first = await create()
+    const second = await create()
+    const secondQuery = 'Second session: explain how concurrent conversations retain independent model settings, cancellation, and answer delivery without affecting each other.'
+    await request('PATCH', `/api/v1/sessions/${first}/model`, { provider: 'openai', model: 'gpt-6.1-sol' })
+    await request('PATCH', `/api/v1/sessions/${second}/model`, { provider: 'openai', model: 'gpt-6' })
+    const id = randomUUID()
+    expect((await request('POST', `/api/v1/sessions/${first}/messages`, { id, query: 'First' })).statusCode).toBe(202)
+    expect((await request('POST', `/api/v1/sessions/${first}/messages`, { id, query: 'First' })).statusCode).toBe(202)
+    expect((await request('POST', `/api/v1/sessions/${first}/messages`, { id, query: 'Different' })).statusCode).toBe(409)
+    await request('POST', `/api/v1/sessions/${second}/messages`, { id: randomUUID(), query: secondQuery })
+    await vi.waitFor(() => expect(fixture.executions).toHaveLength(2))
+    expect(fixture.executions.find((execution) => execution.session === first)?.target).toBe('openai/gpt-6.1-sol')
+    expect(fixture.executions.find((execution) => execution.session === second)?.target).toBe('openai/gpt-6')
+    const list = (await request('GET', '/api/v1/sessions/page')).json().sessions as { id: string, status: string }[]
+    expect(list.filter((session) => session.status === 'wip')).toHaveLength(2)
+    await request('POST', `/api/v1/sessions/${first}/stop`)
+    expect((await request('GET', `/api/v1/sessions/${first}`)).json().is_running).toBe(false)
+    expect((await request('GET', `/api/v1/sessions/${second}`)).json().is_running).toBe(true)
+    fixture.executions.find((execution) => execution.session === second)!.release()
+    await vi.waitFor(async () => {
+      const result = (await request('GET', `/api/v1/sessions/${second}`)).json()
+      expect(result.is_running).toBe(false)
+      expect(result.messages.filter((message: { who: string }) => message.who === 'leon'))
+        .toEqual([expect.objectContaining({ message: `Done: ${secondQuery}` })])
+    })
+    const history = (await request('GET', `/api/v1/sessions/${first}`)).json()
+    expect(history.messages.filter((message: { who: string }) => message.who === 'owner')).toHaveLength(1)
+    expect(history.messages.some((message: { message: string }) => message.message.includes('Second'))).toBe(false)
+    expect(vi.mocked(POST_TURN_MAINTENANCE_QUEUE.enqueue).mock.calls.map(([label]) => label)).toEqual([
+      'turn memory observation', 'react self-model reflection'
+    ])
+    expect(vi.mocked(POST_TURN_MAINTENANCE_QUEUE.enqueueBatch).mock.calls[0]?.[0]).toBe('memory extraction')
+    const background = vi.mocked(POST_TURN_MAINTENANCE_QUEUE.startConcurrent).mock.calls.find(([label]) => label === 'FYI generation')![1]
+    await runWithProfileContext({ profileName: profile }, () => background())
+    const enriched = (await request('GET', `/api/v1/sessions/${second}`)).json()
+    expect(enriched.is_running).toBe(false)
+    expect(enriched.messages.at(-1)).toMatchObject({ message: `Done: ${secondQuery}`, fyi: { kind: FyiKind.Fact } })
+    await runWithProfileContext({ profileName: profile }, () => {
+      const event = CONVERSATION_REPOSITORY.readEvents<ConversationEvent>(0).items.find((event) => event.type === 'fyi')
+      expect(event).toMatchObject({ session_id: second, response_id: enriched.messages.at(-1).messageId })
+    })
+  })
+
+  it('validates model capabilities and preserves settings per session', async () => {
+    const id = await create()
+    const catalog = (await request('GET', '/api/v1/sessions/models')).json()
+    const provider = catalog.providers.find((item: { id: string }) => item.id === 'openai')
+    const model = provider.models[0]
+    const response = await request('PATCH', `/api/v1/sessions/${id}/model`, {
+      provider: provider.id, model: model.model, reasoning: 'high', speed: 'fast'
+    })
+    expect(response.statusCode).toBe(200)
+    expect(response.json().selection.settings).toEqual({ reasoning: 'high', speed: 'fast' })
+    const other = await create()
+    expect((await request('GET', `/api/v1/sessions/${other}`)).json().session.modelSettings).toBeUndefined()
+    const unsupported = catalog.providers.find((item: { models: { speed: string[] }[] }) =>
+      item.models.some((candidate) => !candidate.speed.includes('fast')))
+    const unsupportedModel = unsupported.models.find((item: { speed: string[] }) => !item.speed.includes('fast'))
+    expect((await request('PATCH', `/api/v1/sessions/${id}/model`, {
+      provider: unsupported.id, model: unsupportedModel.model, speed: 'fast'
+    })).statusCode).toBe(400)
+    expect((await request('GET', `/api/v1/sessions/${id}`)).json().selection.settings.speed).toBe('fast')
+  })
+
+  it('streams viewed-session details and offscreen status without leaking other answers', async () => {
+    const first = await create()
+    const second = await create()
+    const address = await app.listen({ port: 0, host: '127.0.0.1' })
+    const controller = new AbortController()
+    const response = await fetch(`${address}/api/v1/sessions/events?session_id=${first}&after=0`, {
+      headers: { 'x-test-profile': profile }, signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5_000)])
+    })
+    expect(response.headers.get('content-type')).toBe('text/event-stream')
+    const reader = response.body!.getReader()
+    const received = (async (): Promise<string> => {
+      let text = ''
+      while (!text.includes('Done: First')) {
+        const chunk = await reader.read()
+        if (chunk.done) {
+          break
+        }
+        text += new TextDecoder().decode(chunk.value)
+      }
+
+      return text
+    })()
+    try {
+      await request('POST', `/api/v1/sessions/${first}/messages`, { id: randomUUID(), query: 'First' })
+      await request('POST', `/api/v1/sessions/${second}/messages`, { id: randomUUID(), query: 'Second' })
+      await vi.waitFor(() => expect(fixture.executions).toHaveLength(2))
+      fixture.executions.find((execution) => execution.session === second)!.release()
+      await vi.waitFor(async () => expect((await request('GET', `/api/v1/sessions/${second}`)).json().is_running).toBe(false))
+      fixture.executions.find((execution) => execution.session === first)!.release()
+      const text = await received
+      expect(text).toContain('Public reasoning')
+      expect(text).toContain(second)
+      expect(text).not.toContain('Done: Second')
+    } finally {
+      controller.abort()
+      await reader.cancel().catch(() => undefined)
+    }
+  })
+
+  it('captures a model/settings snapshot before work is queued', async () => {
+    await runWithProfileContext({ profileName: profile }, async () => {
+      const id = CONVERSATION_SESSION_MANAGER.createSession().id
+      const provider = 'openai'
+      const model = 'gpt-6.1-sol'
+      await CONVERSATION_SESSION_MANAGER.setSessionModelFromProvider(id, provider, model)
+      CONVERSATION_SESSION_MANAGER.updateSession(id, {
+        modelSettings: { [`${provider}/${model}`]: { reasoning: 'high', speed: 'fast' } }
+      })
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => { release = resolve })
+      const operation = CONVERSATION_SESSION_MANAGER.runWithSession(id, async () => {
+        await gate
+        const target = CONFIG_STATE.getModelState().getAgentTarget()
+        expect(target.model).toBe(model)
+        expect(CONFIG_STATE.getModelSettingsState().getSettings(target)).toEqual({ reasoning: 'high', speed: 'fast' })
+      })
+      CONVERSATION_SESSION_MANAGER.updateSession(id, { modelTarget: 'openai/gpt-6', modelSettings: {} })
+      release()
+      await operation
+    })
+  })
+
+  it('keeps optimistic and streamed feed identity stable across acknowledgements and retries', () => {
+    const messages: ConversationRecord[] = [
+      { who: 'owner', messageId: 'request', message: 'Hello', sentAt: 10, isAddedToHistory: true },
+      { who: 'leon', messageId: 'request:leon', message: '', sentAt: 10, isAddedToHistory: false }
+    ]
+    const event: ConversationEvent = {
+      sequence: 1, type: 'owner_message', session_id: 'session', turn_id: 'request', response_id: null,
+      created_at: 20, data: { message: { ...messages[0], sentAt: 20 } }
+    }
+    const acknowledged = applyConversationEvent(messages, event).sort((left, right) => left.sentAt - right.sentAt)
+    expect(acknowledged.map((record) => record.who)).toEqual(['owner', 'leon'])
+    const ownerEntry = toFeedEntry(acknowledged[0]!, true)
+    const streamed = applyConversationEvent(acknowledged, {
+      ...event, sequence: 2, type: 'text_stream', response_id: 'request:leon', data: { kind: 'answer', token: 'Hello!', generationId: 'draft' }
+    })
+    expect(toFeedEntry(streamed[0]!, true)).toBe(ownerEntry)
+    const final = applyConversationEvent(streamed, {
+      ...event, sequence: 3, type: 'final_answer', response_id: 'request:leon', data: { content: 'Accepted answer', artifacts: [] }
+    })
+    const lateReset = applyConversationEvent(final, {
+      ...event, sequence: 4, type: 'text_stream', response_id: 'request:leon', data: { kind: 'answer', token: '', reset: true, generationId: 'draft' }
+    })
+    expect(lateReset).toBe(final)
+    expect(lateReset.at(-1)?.message).toBe('Accepted answer')
+  })
+
+  it('does not start queued background work after the owning session is deleted', async () => {
+    await runWithProfileContext({ profileName: profile }, async () => {
+      const session = CONVERSATION_SESSION_MANAGER.createSession()
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => { release = resolve })
+      const first = CONVERSATION_SESSION_MANAGER.runWithSession(session.id, () => gate)
+      const queued = vi.fn()
+      const second = CONVERSATION_SESSION_MANAGER.runWithSession(session.id, queued)
+      const rejected = expect(second).rejects.toThrow('does not exist')
+      CONVERSATION_SESSION_MANAGER.deleteSession(session.id)
+      release()
+      await first.catch(() => undefined)
+      await rejected
+      expect(queued).not.toHaveBeenCalled()
+      expect(CONVERSATION_REPOSITORY.readSession(session.id)).toBeNull()
+    })
+  })
+
+  it('adopts unfinished task checkpoints into their session and removes them with the conversation', async () => {
+    await runWithProfileContext({ profileName: profile }, async () => {
+      const session = CONVERSATION_SESSION_MANAGER.createSession()
+      const state = createAgentLoopContinuationState({
+        originalInput: 'Report the saved receipt.', clarificationQuestion: 'Model unavailable.',
+        planWidgetId: 'receipt-plan', activeSkillId: null, loadedToolkitIds: [],
+        trackedSteps: [{ label: 'Report receipt', status: 'in_progress' }],
+        executionHistory: [{ function: 'receipt.save', status: 'success', observation: 'Receipt: release-42.' }],
+        transcript: [{ role: 'user', content: 'Report the saved receipt.' }]
+      })
+      const legacy = new ContextStateStore<AgentLoopContinuationState | null>(
+        `.agent-loop-continuation-state.json--${session.id}`, null
+      )
+      legacy.save(state)
+      const checkpointPath = path.join(fixture.root, profile, 'sessions', session.id, '.agent-loop-continuation-state.json')
+
+      await runWithConversationSession({ sessionId: session.id }, async () => {
+        const first = new AgentSessionState().getContinuationStore()
+        expect(first.load()).toEqual(state)
+        expect(legacy.load()).toBeNull()
+        expect(new AgentSessionState().getContinuationStore().load()).toEqual(state)
+        expect(JSON.parse(await fs.readFile(checkpointPath, 'utf8'))).toEqual(state)
+      })
+
+      CONVERSATION_SESSION_MANAGER.deleteSession(session.id)
+      await expect(fs.access(checkpointPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    })
+  })
+
+  it('preserves the last checkpoint when publishing a replacement fails', async () => {
+    const store = new ContextStateStore('checkpoint.json', { receipt: '' }, fixture.root)
+    store.save({ receipt: 'release-42' })
+    const rename = vi.spyOn(syncFs, 'renameSync').mockImplementationOnce(() => {
+      throw new Error('Storage unavailable')
+    })
+
+    try {
+      store.save({ receipt: 'release-43' })
+      expect(store.load()).toEqual({ receipt: 'release-42' })
+      expect(await fs.readdir(fixture.root)).toEqual(['checkpoint.json'])
+    } finally {
+      rename.mockRestore()
+    }
+
+    store.save({ receipt: 'release-43' })
+    expect(store.load()).toEqual({ receipt: 'release-43' })
+  })
+})

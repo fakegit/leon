@@ -1,0 +1,36 @@
+{
+  "$schema": "../../../schemas/tool-schemas/tool.json",
+  "tool_id": "notion",
+  "previous_tool_ids": ["notion-mcp"],
+  "toolkit_id": "productivity_collaboration",
+  "name": "Notion",
+  "version": "1.0.0",
+  "description": "Work with your Notion pages through its official MCP server.",
+  "icon_name": "notion-line",
+  "author": {
+    "name": "Louis Grenard",
+    "github": "louistiti",
+    "email": "louis@getleon.ai",
+    "discord": {
+      "username": "louistiti",
+      "id": "86842425233936384"
+    }
+  },
+  "maintainers": [
+    {
+      "name": "Louis Grenard",
+      "email": "louis@getleon.ai",
+      "github": "louistiti",
+      "discord": {
+        "username": "louistiti",
+        "id": "86842425233936384"
+      }
+    }
+  ],
+  "distribution": "extension",
+  "maintenance": "official",
+  "logo": "logo.svg",
+  "logo_mask": "inverse-luminance",
+  "source": { "type": "mcp", "transport": "http", "url": "https://mcp.notion.com/mcp" },
+  "functions": {}
+}

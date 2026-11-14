@@ -1,0 +1,32 @@
+{
+  "$schema": "../../../schemas/skill-schemas/skill.json",
+  "name": "Help",
+  "icon_name": "question-line",
+  "bridge": "nodejs",
+  "version": "1.0.0",
+  "description": "Helps you get started with Leon.",
+  "distribution": "built-in",
+  "maintenance": "official",
+  "maintainers": [
+    {
+      "name": "Louis Grenard",
+      "email": "louis@getleon.ai",
+      "github": "louistiti",
+      "discord": {
+        "username": "louistiti",
+        "id": "86842425233936384"
+      }
+    }
+  ],
+  "author": {
+    "name": "Théo LUDWIG",
+    "email": "contact@theoludwig.fr",
+    "url": "https://theoludwig.fr"
+  },
+  "actions": {
+    "help": {
+      "type": "logic",
+      "description": "List Leon's available skills and what they do."
+    }
+  }
+}

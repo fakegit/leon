@@ -1,0 +1,34 @@
+import path from 'node:path'
+
+import dotenv from 'dotenv'
+import { configDefaults, defineConfig } from 'vitest/config'
+
+import { PROFILE_DOT_ENV_PATH } from './server/src/leon-roots.ts'
+
+const ROOT_DIR = path.resolve()
+
+dotenv.config({ path: PROFILE_DOT_ENV_PATH })
+
+export default defineConfig({
+  resolve: {
+    alias: {
+      '@@': ROOT_DIR,
+      '@': path.join(ROOT_DIR, 'server', 'src'),
+      '@bridge': path.join(ROOT_DIR, 'bridges', 'nodejs', 'src'),
+      '@sdk': path.join(ROOT_DIR, 'bridges', 'nodejs', 'src', 'sdk')
+    }
+  },
+  test: {
+    environment: 'node',
+    exclude: [...configDefaults.exclude, '**/tmp/**', 'test/web-app/**'],
+    fileParallelism: true,
+    maxWorkers: 4,
+    // Real scenarios use isolated child runtimes; bound paid calls and native resources.
+    maxConcurrency: 2,
+    disableConsoleIntercept: true,
+    restoreMocks: true,
+    clearMocks: true,
+    unstubEnvs: true,
+    testTimeout: 120_000
+  }
+})
